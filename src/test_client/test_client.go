@@ -3,7 +3,6 @@
 package test_client
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"main/src/model"
@@ -64,9 +63,9 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 		lastSegment,
 	)
 
-	counter := 0
-	counterMediumPriority := 0
-	counterHighPriority := 0
+	//counter := 0
+	//counterMediumPriority := 0
+	//counterHighPriority := 0
 	// Comentado: Variáveis de contador para prioridade, não usadas no ABR v1.0
 	// counter := 0
 	// counterMediumPriority := 0
@@ -93,7 +92,7 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 		for iTile := 1; iTile <= 120; iTile++ {
 			tile, segment := iTile, iSegment
 
-			priority := model.LOW_PRIORITY
+			//priority := model.LOW_PRIORITY
 			priority := model.LOW_PRIORITY // Prioridade fixada para LOW no ABR v1.0
 
 			// Comentado: Lógica de classificação de prioridade, não usada no ABR v1.0
@@ -116,6 +115,7 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 				}()
 
 				timeToReceive := playbackSimulator.GetTimeToReceive(segment)
+				var instaThroughput float64 // Declara instaThroughput aqui para ter o escopo correto
 
 				request := model.VideoPacketRequest{
 					ID:       uuid.Must(uuid.New(), nil),
@@ -129,20 +129,20 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 				// Log de envio da requisição
 				fmt.Printf("Sending request for segment %d, tile %d with priority %d\n", segment, tile, priority)
 
-				// Obtém o tamanho da request em bytes
-				requestBytes, err := json.Marshal(request)
-				if err != nil {
-					return
-				}
+				// Registra o tempo de envio da requisição ANTES de enviá-la
+				collector.RecordSend(request.ID)
 
-				sizeInBytes := len(requestBytes)
-
-				// Registra a request, o tamanho e realiza o cálculo da vazão instantenea
-				_, instaThroughput := collector.RecordRecv(request.ID, sizeInBytes)
-				//avgThroughput := collector.AvgThroughput()
+				// As linhas abaixo foram removidas pois o cálculo de vazão era prematuro e com dados errados
+				// requestBytes, err := json.Marshal(request)
+				// if err != nil {
+				// 	return
+				// }
+				// sizeInBytes := len(requestBytes)
+				// _, instaThroughput := collector.RecordRecv(request.ID, sizeInBytes)
 
 				if timeToReceive == 0 {
 					fmt.Printf("Skipped (timeout) segment %d, tile %d\n", segment, tile)
+					instaThroughput = 0.0 // Define como 0.0 para caso de timeout
 					if statisticsLogger != nil {
 						statisticsLogger.Log(time.Since(startTime), request,
 							baseLatency+segmentDuration, true, true, false, instaThroughput)
@@ -154,17 +154,21 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 				response := client.Request(request, timeToReceive)
 				responseTime := time.Since(startTime)
 
-				// Remove a request do mapa de pendentes
-				collector.RecordSend(request.ID)
+				// A chamada para collector.RecordSend foi movida para antes do request.
+				// Esta linha original é agora redundante e deve ser removida/comentada.
+				// collector.RecordSend(request.ID)
 
 				var timedOut bool
 				if response == nil {
 					fmt.Printf("Timeout: no response for segment %d, tile %d\n", segment, tile)
 					timedOut = true
+					instaThroughput = 0.0 // Define como 0.0 para caso de timeout
 				} else {
 					if len(response.Data) == 0 {
 						log.Panicf("Empty response for (%d, %d)", segment, tile)
 					}
+					// Registra o recebimento da resposta com o tamanho correto dos dados.
+					_, instaThroughput = collector.RecordRecv(request.ID, len(response.Data)) // Atribui ao instaThroughput já declarado
 
 					if playbackSimulator.GetTimeToReceive(segment) == 0 {
 						fmt.Printf("Late response for segment %d, tile %d\n", segment, tile)
@@ -200,14 +204,15 @@ func AdaptationAlg() {
 
 // adaptBitrate decide a taxa de bits com base na vazão média.
 func adaptBitrate(avgThroughput float64) model.Bitrate {
-	// Estes são thresholds arbitrários para demonstração.
-	// Podem ser ajustados com base nos testes.
-	// Considerando que as bitrates são 3, 5 e 10.
-	if avgThroughput >= 8.0 {
-		return model.HIGH_BITRATE // 10
-	} else if avgThroughput >= 4.0 {
-		return model.MEDIUM_BITRATE // 5
-	} else {
-		return model.LOW_BITRATE // 3
+	// Thresholds ajustados para ver variação de bitrate com os dados do log.
+	// `model.HIGH_BITRATE` = 10
+	// `model.MEDIUM_BITRATE` = 5
+	// `model.LOW_BITRATE` = 3
+	if avgThroughput >= 60000.0 { // Se a vazão for muito alta, use a maior taxa.
+		return model.HIGH_BITRATE
+	} else if avgThroughput >= 30000.0 { // Se a vazão for média, use a taxa média.
+		return model.MEDIUM_BITRATE
+	} else { // Se a vazão for baixa, use a menor taxa.
+		return model.LOW_BITRATE
 	}
 }
