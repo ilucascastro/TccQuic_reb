@@ -120,7 +120,7 @@ REMOTE_DIR=/tmp/server_scheduler_test
 
 echo -e "${PURPLE}Compiling...${NC}"
 
-(cd ../.. && go build)
+(cd ../.. && /usr/local/go/bin/go build)
 EXIT_CODE=$?
 if [[ $EXIT_CODE != 0 ]]; then
     exit $EXIT_CODE
@@ -135,7 +135,9 @@ withSSH "chmod +x $REMOTE_DIR/main"
 upload "../../data" "$REMOTE_DIR"
 
 upload "resources/server_scheduler_test.py" "$REMOTE_DIR"
+withSSH "dos2unix $REMOTE_DIR/server_scheduler_test.py"
 upload "resources/utils.py" "$REMOTE_DIR"
+withSSH "dos2unix $REMOTE_DIR/utils.py"
 
 echo -e "${PURPLE}Executing...${NC}"
 

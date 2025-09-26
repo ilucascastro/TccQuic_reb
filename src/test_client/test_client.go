@@ -67,34 +67,44 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 	counter := 0
 	counterMediumPriority := 0
 	counterHighPriority := 0
+	// Comentado: Variáveis de contador para prioridade, não usadas no ABR v1.0
+	// counter := 0
+	// counterMediumPriority := 0
+	// counterHighPriority := 0
 
 	parallelismSemaphore := NewSemaphore(parallelism)
 
-	log.Printf("Test started with parallelism = %d", parallelism)
+	log.Printf("Starting test iteration for segments %d to %d", firstSegment, lastSegment)
 	fmt.Printf("Test started with parallelism = %d\n", parallelism)
 
 	playbackSimulator.Start()
 
 	// Inicia o pacote de coleta de dados da rede com uma window size
 	collector := netstats.New(177)
+	currentBitrate := model.HIGH_BITRATE // Inicializa a taxa de bits com o valor mais alto
 
 	for iSegment := firstSegment; iSegment <= lastSegment; iSegment++ {
 		log.Printf("Processing segment %d", iSegment)
 
+		// ABR logic: Adapt bitrate based on average throughput
+		avgThroughput := collector.AvgThroughput()
+		currentBitrate = adaptBitrate(avgThroughput)
+		log.Printf("ABR: Average Throughput = %.2f, Selected Bitrate = %d", avgThroughput, currentBitrate)
 		for iTile := 1; iTile <= 120; iTile++ {
 			tile, segment := iTile, iSegment
 
 			priority := model.LOW_PRIORITY
+			priority := model.LOW_PRIORITY // Prioridade fixada para LOW no ABR v1.0
 
-			// Classifica a prioridade do segmento (algoritmo de adaptação)
-			if float64(counterHighPriority)/float64(counter+1) < highPriorityRatio {
-				priority = model.HIGH_PRIORITY
-				counterHighPriority++
-			} else if float64(counterMediumPriority)/float64(counter+1) < mediumPriorityRatio {
-				priority = model.MEDIUM_PRIORITY
-				counterMediumPriority++
-			}
-			counter++
+			// Comentado: Lógica de classificação de prioridade, não usada no ABR v1.0
+			// if float64(counterHighPriority)/float64(counter+1) < highPriorityRatio {
+			// 	priority = model.HIGH_PRIORITY
+			// 	counterHighPriority++
+			// } else if float64(counterMediumPriority)/float64(counter+1) < mediumPriorityRatio {
+			// 	priority = model.MEDIUM_PRIORITY
+			// 	counterMediumPriority++
+			// }
+			// counter++
 
 			parallelismSemaphore.Acquire()
 			wg.Add(1)
@@ -110,7 +120,7 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 				request := model.VideoPacketRequest{
 					ID:       uuid.Must(uuid.New(), nil),
 					Priority: priority,
-					Bitrate:  model.HIGH_BITRATE,
+					Bitrate:  currentBitrate, // Usar a taxa de bits adaptada
 					Segment:  segment,
 					Tile:     tile,
 					Timeout:  int(timeToReceive.Milliseconds()),
@@ -186,4 +196,18 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 // identificação do tile + segmento + prioridade (fov)
 func AdaptationAlg() {
 
+}
+
+// adaptBitrate decide a taxa de bits com base na vazão média.
+func adaptBitrate(avgThroughput float64) model.Bitrate {
+	// Estes são thresholds arbitrários para demonstração.
+	// Podem ser ajustados com base nos testes.
+	// Considerando que as bitrates são 3, 5 e 10.
+	if avgThroughput >= 8.0 {
+		return model.HIGH_BITRATE // 10
+	} else if avgThroughput >= 4.0 {
+		return model.MEDIUM_BITRATE // 5
+	} else {
+		return model.LOW_BITRATE // 3
+	}
 }
