@@ -202,17 +202,28 @@ func AdaptationAlg() {
 
 }
 
-// adaptBitrate decide a taxa de bits com base na vazão média.
+// Definir uma estrutura para associar Bitrate com seu Threshold (vazão mínima)
+type BitrateInfo struct {
+	Bitrate   model.Bitrate
+	Threshold float64
+}
+
+// Slice de BitrateInfo, ordenado do maior Threshold para o menor.
+// Isso permite que o algoritmo selecione a maior taxa de bits que a vazão atual suporta.
+var availableBitrates = []BitrateInfo{
+	{Bitrate: model.HIGH_BITRATE, Threshold: 60000.0},
+	{Bitrate: model.MEDIUM_BITRATE, Threshold: 30000.0},
+	{Bitrate: model.LOW_BITRATE, Threshold: 0.0}, // LOW_BITRATE é o fallback se a vazão for muito baixa
+}
+
+// adaptBitrate decide a taxa de bits com base na vazão média e nos bitrates disponíveis.
 func adaptBitrate(avgThroughput float64) model.Bitrate {
-	// Thresholds ajustados para ver variação de bitrate com os dados do log.
-	// `model.HIGH_BITRATE` = 10
-	// `model.MEDIUM_BITRATE` = 5
-	// `model.LOW_BITRATE` = 3
-	if avgThroughput >= 60000.0 { // Se a vazão for muito alta, use a maior taxa.
-		return model.HIGH_BITRATE
-	} else if avgThroughput >= 30000.0 { // Se a vazão for média, use a taxa média.
-		return model.MEDIUM_BITRATE
-	} else { // Se a vazão for baixa, use a menor taxa.
-		return model.LOW_BITRATE
+	for _, brInfo := range availableBitrates {
+		if avgThroughput >= brInfo.Threshold {
+			return brInfo.Bitrate
+		}
 	}
+	// Fallback: Se por algum motivo nenhum threshold for atingido (o que não deve acontecer
+	// com o LOW_BITRATE.Threshold = 0), retorna a menor taxa de bits.
+	return model.LOW_BITRATE
 }
