@@ -89,3 +89,25 @@ func (p *PlaybackSimulator) GetTimeToReceive(segment int) time.Duration {
 		return result
 	}
 }
+
+// GetBufferLevel retorna nivel atual do buffer
+// diferenca entre o ultimo segmento baixado e o proximo segmento a ser reproduzido
+func (p *PlaybackSimulator) GetBufferLevel(lastDownloadedSegment int) time.Duration {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	if lastDownloadedSegment <= p.currentPlaybackSegment {
+		return 0 // Buffer vazio ou segmento atual já reproduzido
+	}
+
+	// Calcula o tempo total de mídia disponível no buffer
+	// Correção: Adiciona a duração do segmento para obter o tempo de *término* do último segmento baixado
+	bufferEndTime := p.segmentPlaybackTime[lastDownloadedSegment].Add(p.segmentDuration)
+	playbackTime := p.segmentPlaybackTime[p.currentPlaybackSegment+1] // Tempo que o próximo segmento deveria começar a tocar
+
+	if bufferEndTime.Before(playbackTime) || bufferEndTime.Equal(playbackTime) {
+		return 0
+	}
+
+	return bufferEndTime.Sub(playbackTime)
+}

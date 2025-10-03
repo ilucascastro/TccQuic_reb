@@ -9,6 +9,7 @@ import (
 	"main/src/test_client/netstats"
 	"os"
 	"sync"
+	"sync/atomic" // Adiciona o import para sync/atomic
 	"time"
 
 	"github.com/google/uuid"
@@ -81,14 +82,22 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 	// Inicia o pacote de coleta de dados da rede com uma window size
 	collector := netstats.New(177)
 	currentBitrate := model.HIGH_BITRATE // Inicializa a taxa de bits com o valor mais alto
+	var lastDownloadedSegment atomic.Int32 // Declara como atomic.Int32
+	lastDownloadedSegment.Store(int32(firstSegment - 1)) // Inicializa de forma atômica
 
 	for iSegment := firstSegment; iSegment <= lastSegment; iSegment++ {
 		log.Printf("Processing segment %d", iSegment)
 
-		// ABR logic: Adapt bitrate based on average throughput
+		// ABR logic: Adapt bitrate based on average throughput and buffer level
 		avgThroughput := collector.AvgThroughput()
-		currentBitrate = adaptBitrate(avgThroughput)
-		log.Printf("ABR: Average Throughput = %.2f, Selected Bitrate = %d", avgThroughput, currentBitrate)
+		// Lê o valor de lastDownloadedSegment de forma atômica
+		bufferLevel := playbackSimulator.GetBufferLevel(int(lastDownloadedSegment.Load()))
+		currentBitrate = adaptBitrateWithBuffer(avgThroughput, bufferLevel)
+		log.Printf("ABR: Average Throughput = %.2f, Buffer Level = %.2f s, Selected Bitrate = %d", avgThroughput, bufferLevel.Seconds(), currentBitrate)
+
+		// MOVIDO PARA AQUI: Espera que o segmento atual comece a ser reproduzido, mas depois que a decisão de ABR para ele foi feita.
+		playbackSimulator.WaitForPlaybackStart(iSegment)
+
 		for iTile := 1; iTile <= 120; iTile++ {
 			tile, segment := iTile, iSegment
 
@@ -179,14 +188,27 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 					}
 				}
 
+				if response != nil {
+					// Atualiza o último segmento baixado de forma atômica, apenas se o novo segmento for maior
+					for {
+						oldValue := lastDownloadedSegment.Load()
+						if int32(segment) > oldValue {
+							if lastDownloadedSegment.CompareAndSwap(oldValue, int32(segment)) {
+								break // Atualizado com sucesso
+							}
+							// Se CompareAndSwap falhou, outro goroutine atualizou, tenta novamente
+						} else {
+							break // Segmento atual não é maior, não precisa atualizar
+						}
+					}
+				}
+
 				if statisticsLogger != nil {
 					statisticsLogger.Log(requestTime, request,
 						responseTime-requestTime, timedOut, false, !timedOut, instaThroughput)
 				}
 			}()
 		}
-
-		playbackSimulator.WaitForPlaybackStart(iSegment)
 	}
 
 	log.Println("Waiting for all goroutines to finish...")
@@ -216,14 +238,40 @@ var availableBitrates = []BitrateInfo{
 	{Bitrate: model.LOW_BITRATE, Threshold: 0.0}, // LOW_BITRATE é o fallback se a vazão for muito baixa
 }
 
-// adaptBitrate decide a taxa de bits com base na vazão média e nos bitrates disponíveis.
-func adaptBitrate(avgThroughput float64) model.Bitrate {
+// Comentado: adaptBitrate decide a taxa de bits com base na vazão média e nos bitrates disponíveis.
+// func adaptBitrate(avgThroughput float64) model.Bitrate {
+// 	for _, brInfo := range availableBitrates {
+// 		if avgThroughput >= brInfo.Threshold {
+// 			return brInfo.Bitrate
+// 		}
+// 	}
+// 	// Fallback: Se por algum motivo nenhum threshold for atingido (o que não deve acontecer
+// 	// com o LOW_BITRATE.Threshold = 0), retorna a menor taxa de bits.
+// 	return model.LOW_BITRATE
+// }
+
+// adaptBitrateWithBuffer decide a taxa de bits com base na vazão média, buffer level e nos bitrates disponíveis.
+func adaptBitrateWithBuffer(avgThroughput float64, bufferLevel time.Duration) model.Bitrate {
+	// Definir os limites do buffer. Estes valores podem ser ajustados.
+	const minBufferLevel = 2 * time.Second   // Exemplo: se o buffer for menor que 2 segundos, priorizar o preenchimento
+	const maxBufferLevel = 10 * time.Second // Exemplo: se o buffer for maior que 10 segundos, pode tentar bitrate mais alto
+
+	// Lógica básica:
+	// 1. Se o buffer estiver muito baixo, priorizar um bitrate mais baixo para encher o buffer rapidamente.
+	if bufferLevel < minBufferLevel {
+		log.Printf("ABR (Buffer): Buffer level (%v) is below minimum (%v). Forcing LOW_BITRATE.", bufferLevel, minBufferLevel)
+		return model.LOW_BITRATE
+	}
+
+	// 2. Se o buffersaudáve estiver l (entre min e max), usar a lógica de vazão.
+	// 3. Se o buffer estiver cheio, podemos ser mais agressivos com o bitrate (ou simplesmente usar a lógica de vazão).
+
+	// Lógica de vazão adaptada (a mesma de adaptBitrate, mas agora com a consideração do buffer)
 	for _, brInfo := range availableBitrates {
 		if avgThroughput >= brInfo.Threshold {
 			return brInfo.Bitrate
 		}
 	}
-	// Fallback: Se por algum motivo nenhum threshold for atingido (o que não deve acontecer
-	// com o LOW_BITRATE.Threshold = 0), retorna a menor taxa de bits.
+
 	return model.LOW_BITRATE
 }
