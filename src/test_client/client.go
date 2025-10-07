@@ -137,15 +137,22 @@ func (c *Client) requestWithStream(stream quic.Stream,
 		segment: r.Segment,
 		tile:    r.Tile,
 	}
-	responseChannel := make(chan *model.VideoPacketResponse) // buffer?
+	responseChannel := make(chan *model.VideoPacketResponse, 1)
 	c.waitingResponsesMutex.Lock()
 	c.waitingResponses[id] = responseChannel
 	c.waitingResponsesMutex.Unlock()
 
+	defer func() {
+		c.waitingResponsesMutex.Lock()
+		if ch, ok := c.waitingResponses[id]; ok && ch == responseChannel {
+			delete(c.waitingResponses, id)
+		}
+		c.waitingResponsesMutex.Unlock()
+	}()
+
 	// Request
 
 	if err := r.Write(stream); err != nil {
-		delete(c.waitingResponses, id)
 		log.Println("Write failed: ", err)
 		return nil
 	}
@@ -159,7 +166,7 @@ func (c *Client) requestWithStream(stream quic.Stream,
 			c.replayBuffer.AddResponse(res)
 		}
 		return res
-	case <-time.After(time.Duration(timeout)):
+	case <-time.After(timeout):
 		return nil
 	}
 }

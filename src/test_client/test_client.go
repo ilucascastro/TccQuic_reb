@@ -95,8 +95,17 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 		currentBitrate = adaptBitrateWithBuffer(avgThroughput, bufferLevel)
 		log.Printf("ABR: Average Throughput = %.2f, Buffer Level = %.2f s, Selected Bitrate = %d", avgThroughput, bufferLevel.Seconds(), currentBitrate)
 
-		// MOVIDO PARA AQUI: Espera que o segmento atual comece a ser reproduzido, mas depois que a decisão de ABR para ele foi feita.
-		playbackSimulator.WaitForPlaybackStart(iSegment)
+		timeBudget := playbackSimulator.GetTimeToReceive(iSegment)
+		if timeBudget <= 0 {
+			timeBudget = segmentDuration
+		}
+		maxAhead := 3 * segmentDuration
+		if timeBudget > maxAhead {
+			timeBudget = maxAhead
+		}
+		timeBudget += segmentDuration
+		segmentDeadline := time.Now().Add(timeBudget)
+		segmentBitrate := currentBitrate
 
 		for iTile := 1; iTile <= 120; iTile++ {
 			tile, segment := iTile, iSegment
@@ -117,22 +126,42 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 			parallelismSemaphore.Acquire()
 			wg.Add(1)
 
-			go func() {
+			go func(deadline time.Time, bitrate model.Bitrate) {
 				defer func() {
 					parallelismSemaphore.Release()
 					wg.Done()
 				}()
 
-				timeToReceive := playbackSimulator.GetTimeToReceive(segment)
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					fmt.Printf("Skipped (timeout) segment %d, tile %d\n", segment, tile)
+					if statisticsLogger != nil {
+						statisticsLogger.Log(time.Since(startTime), model.VideoPacketRequest{
+							ID:       uuid.Nil,
+							Priority: priority,
+							Bitrate:  bitrate,
+							Segment:  segment,
+							Tile:     tile,
+							Timeout:  0,
+						}, 0, true, true, false, 0.0)
+					}
+					return
+				}
+
+				timeoutMs := int(remaining / time.Millisecond)
+				if timeoutMs <= 0 {
+					timeoutMs = 1
+				}
+
 				var instaThroughput float64 // Declara instaThroughput aqui para ter o escopo correto
 
 				request := model.VideoPacketRequest{
 					ID:       uuid.Must(uuid.New(), nil),
 					Priority: priority,
-					Bitrate:  currentBitrate, // Usar a taxa de bits adaptada
+					Bitrate:  bitrate,
 					Segment:  segment,
 					Tile:     tile,
-					Timeout:  int(timeToReceive.Milliseconds()),
+					Timeout:  timeoutMs,
 				}
 
 				// Log de envio da requisição
@@ -149,18 +178,8 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 				// sizeInBytes := len(requestBytes)
 				// _, instaThroughput := collector.RecordRecv(request.ID, sizeInBytes)
 
-				if timeToReceive == 0 {
-					fmt.Printf("Skipped (timeout) segment %d, tile %d\n", segment, tile)
-					instaThroughput = 0.0 // Define como 0.0 para caso de timeout
-					if statisticsLogger != nil {
-						statisticsLogger.Log(time.Since(startTime), request,
-							baseLatency+segmentDuration, true, true, false, instaThroughput)
-					}
-					return
-				}
-
 				requestTime := time.Since(startTime)
-				response := client.Request(request, timeToReceive)
+				response := client.Request(request, remaining)
 				responseTime := time.Since(startTime)
 
 				// A chamada para collector.RecordSend foi movida para antes do request.
@@ -179,7 +198,7 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 					// Registra o recebimento da resposta com o tamanho correto dos dados.
 					_, instaThroughput = collector.RecordRecv(request.ID, len(response.Data)) // Atribui ao instaThroughput já declarado
 
-					if playbackSimulator.GetTimeToReceive(segment) == 0 {
+					if time.Now().After(deadline) {
 						fmt.Printf("Late response for segment %d, tile %d\n", segment, tile)
 						timedOut = true
 					} else {
@@ -207,7 +226,7 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 					statisticsLogger.Log(requestTime, request,
 						responseTime-requestTime, timedOut, false, !timedOut, instaThroughput)
 				}
-			}()
+			}(segmentDeadline, segmentBitrate)
 		}
 	}
 

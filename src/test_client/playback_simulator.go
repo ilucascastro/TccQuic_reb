@@ -18,6 +18,8 @@ type PlaybackSimulator struct {
 	lastSegment     int
 }
 
+const maxBufferedSegmentsAhead = 3
+
 func NewPlaybackSimulator(
 	segmentDuration time.Duration,
 	baseLatency time.Duration,
@@ -78,7 +80,7 @@ func (p *PlaybackSimulator) GetTimeToReceive(segment int) time.Duration {
 	var result time.Duration = 0
 
 	p.mutex.Lock()
-	if segment == p.currentPlaybackSegment+1 {
+	if segment > p.currentPlaybackSegment {
 		result = time.Until(p.segmentPlaybackTime[segment])
 	}
 	p.mutex.Unlock()
@@ -109,5 +111,11 @@ func (p *PlaybackSimulator) GetBufferLevel(lastDownloadedSegment int) time.Durat
 		return 0
 	}
 
-	return bufferEndTime.Sub(playbackTime)
+	bufferLevel := bufferEndTime.Sub(playbackTime)
+	maxBuffer := time.Duration(maxBufferedSegmentsAhead) * p.segmentDuration
+	if bufferLevel > maxBuffer {
+		return maxBuffer
+	}
+
+	return bufferLevel
 }
