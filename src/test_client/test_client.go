@@ -95,6 +95,10 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 		currentBitrate = adaptBitrateWithBuffer(avgThroughput, bufferLevel)
 		log.Printf("ABR: Average Throughput = %.2f, Buffer Level = %.2f s, Selected Bitrate = %d", avgThroughput, bufferLevel.Seconds(), currentBitrate)
 
+        // Em vez de esperar o início da reprodução do próprio segmento,
+        // aguardamos apenas até que o segmento esteja dentro da janela de
+        // pré-buffer permitida. Isso permite pré-carregar e construir buffer.
+        playbackSimulator.WaitUntilWithinPrefetchWindow(iSegment)
 		timeBudget := playbackSimulator.GetTimeToReceive(iSegment)
 		if timeBudget <= 0 {
 			timeBudget = segmentDuration
@@ -147,12 +151,10 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 					}
 					return
 				}
-
 				timeoutMs := int(remaining / time.Millisecond)
 				if timeoutMs <= 0 {
 					timeoutMs = 1
 				}
-
 				var instaThroughput float64 // Declara instaThroughput aqui para ter o escopo correto
 
 				request := model.VideoPacketRequest{

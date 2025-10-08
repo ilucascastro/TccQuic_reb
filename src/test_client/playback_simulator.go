@@ -65,11 +65,24 @@ func (p *PlaybackSimulator) Start() {
 }
 
 func (p *PlaybackSimulator) WaitForPlaybackStart(segment int) {
-	p.mutex.Lock()
-	for p.currentPlaybackSegment < segment {
-		p.cond.Wait()
-	}
-	p.mutex.Unlock()
+    p.mutex.Lock()
+    for p.currentPlaybackSegment < segment {
+        p.cond.Wait()
+    }
+    p.mutex.Unlock()
+}
+
+// WaitUntilWithinPrefetchWindow bloqueia até que o segmento desejado
+// esteja dentro da janela de pré-buffer permitida à frente da reprodução.
+//
+// Permite que o cliente antecipe o download de segmentos à frente, mas sem
+// ultrapassar a janela de segurança definida em maxBufferedSegmentsAhead.
+func (p *PlaybackSimulator) WaitUntilWithinPrefetchWindow(segment int) {
+    p.mutex.Lock()
+    for (segment - p.currentPlaybackSegment) > maxBufferedSegmentsAhead {
+        p.cond.Wait()
+    }
+    p.mutex.Unlock()
 }
 
 // Returns the time remanining until segment starts being played.

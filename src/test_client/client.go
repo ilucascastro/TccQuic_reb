@@ -153,6 +153,7 @@ func (c *Client) requestWithStream(stream quic.Stream,
 	// Request
 
 	if err := r.Write(stream); err != nil {
+		delete(c.waitingResponses, id)
 		log.Println("Write failed: ", err)
 		return nil
 	}
