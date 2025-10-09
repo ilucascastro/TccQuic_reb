@@ -26,11 +26,11 @@ const mediumPriorityRatio = 0.0
 const highPriorityRatio = 0.3
 
 func StartTestClient(serverURL string, serverPort int, parallelism int, baseLatencyMs int) {
-	client := NewClient(ClientOptions{
-		Pipeline:   pipeline,
-		ServerURL:  serverURL,
-		ServerPort: serverPort,
-	})
+    client := NewClient(ClientOptions{
+        Pipeline:   pipeline,
+        ServerURL:  serverURL,
+        ServerPort: serverPort,
+    })
 
 	log.Println("Base latency =", baseLatencyMs)
 
@@ -40,18 +40,21 @@ func StartTestClient(serverURL string, serverPort int, parallelism int, baseLate
 		return
 	}
 
-	statisticsPath := fmt.Sprintf("statistics-%d.csv", os.Getpid())
+    statisticsPath := fmt.Sprintf("statistics-%d.csv", os.Getpid())
+    summaryPath := fmt.Sprintf("statistics-summary-%d.csv", os.Getpid())
 
-	statisticsLogger := NewStatisticsLogger(statisticsPath)
-	runTestIteration(client, parallelism, baseLatencyMs, statisticsLogger)
-	statisticsLogger.Close()
+    statisticsLogger := NewStatisticsLogger(statisticsPath)
+    summaryLogger := NewSummaryLogger(summaryPath)
+    runTestIteration(client, parallelism, baseLatencyMs, statisticsLogger, summaryLogger)
+    statisticsLogger.Close()
+    summaryLogger.Close()
 }
 
 func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
-	statisticsLogger *StatisticsLogger) {
-	var wg sync.WaitGroup
+    statisticsLogger *StatisticsLogger, summaryLogger *SummaryLogger) {
+    var wg sync.WaitGroup
 
-	startTime := time.Now()
+    startTime := time.Now()
 
 	segmentDuration := 1 * time.Second
 	baseLatency := time.Duration(baseLatencyMs) * time.Millisecond
@@ -77,10 +80,14 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 	log.Printf("Starting test iteration for segments %d to %d", firstSegment, lastSegment)
 	fmt.Printf("Test started with parallelism = %d\n", parallelism)
 
-	playbackSimulator.Start()
+    playbackSimulator.Start()
+
+    // Captura do timestamp do primeiro request de mídia
+    var firstRequestOnce sync.Once
+    var firstRequestTime time.Time
 
 	// Inicia o pacote de coleta de dados da rede com uma window size
-	collector := netstats.New(177)
+	collector := netstats.New(120)
 	currentBitrate := model.HIGH_BITRATE // Inicializa a taxa de bits com o valor mais alto
 	var lastDownloadedSegment atomic.Int32 // Declara como atomic.Int32
 	lastDownloadedSegment.Store(int32(firstSegment - 1)) // Inicializa de forma atômica
@@ -130,11 +137,11 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 			parallelismSemaphore.Acquire()
 			wg.Add(1)
 
-			go func(deadline time.Time, bitrate model.Bitrate) {
-				defer func() {
-					parallelismSemaphore.Release()
-					wg.Done()
-				}()
+            go func(deadline time.Time, bitrate model.Bitrate) {
+                defer func() {
+                    parallelismSemaphore.Release()
+                    wg.Done()
+                }()
 
 				remaining := time.Until(deadline)
 				if remaining <= 0 {
@@ -166,11 +173,14 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 					Timeout:  timeoutMs,
 				}
 
-				// Log de envio da requisição
-				fmt.Printf("Sending request for segment %d, tile %d with priority %d\n", segment, tile, priority)
+                // Log de envio da requisição
+                fmt.Printf("Sending request for segment %d, tile %d with priority %d\n", segment, tile, priority)
 
-				// Registra o tempo de envio da requisição ANTES de enviá-la
-				collector.RecordSend(request.ID)
+                // Marca o primeiro request de mídia (Join latency: t0)
+                firstRequestOnce.Do(func() { firstRequestTime = time.Now() })
+
+                // Registra o tempo de envio da requisição ANTES de enviá-la
+                collector.RecordSend(request.ID)
 
 				// As linhas abaixo foram removidas pois o cálculo de vazão era prematuro e com dados errados
 				// requestBytes, err := json.Marshal(request)
@@ -232,10 +242,26 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 		}
 	}
 
-	log.Println("Waiting for all goroutines to finish...")
-	wg.Wait()
-	log.Println("All goroutines completed.")
-	fmt.Println("Test iteration complete.")
+    log.Println("Waiting for all goroutines to finish...")
+    wg.Wait()
+    log.Println("All goroutines completed.")
+    fmt.Println("Test iteration complete.")
+
+    // Cálculo e registro da Join latency: tempo entre o primeiro request
+    // de mídia e o instante simulado de início do playback.
+    if !firstRequestTime.IsZero() {
+        playbackStart := playbackSimulator.GetPlaybackStartTime()
+        joinLatency := playbackStart.Sub(firstRequestTime)
+        if joinLatency < 0 {
+            joinLatency = 0
+        }
+        if summaryLogger != nil {
+            summaryLogger.LogJoinLatency(joinLatency)
+        }
+        log.Printf("Join latency: %d ms", joinLatency.Milliseconds())
+    } else {
+        log.Println("Join latency: first request timestamp not captured")
+    }
 }
 
 // metricas de rede (vazão instantanea + media)

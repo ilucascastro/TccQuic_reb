@@ -7,10 +7,10 @@ import (
 )
 
 type PlaybackSimulator struct {
-	currentPlaybackSegment int
-	segmentPlaybackTime    []time.Time
-	mutex                  *sync.Mutex
-	cond                   *sync.Cond
+    currentPlaybackSegment int
+    segmentPlaybackTime    []time.Time
+    mutex                  *sync.Mutex
+    cond                   *sync.Cond
 
 	segmentDuration time.Duration
 	baseLatency     time.Duration
@@ -130,5 +130,13 @@ func (p *PlaybackSimulator) GetBufferLevel(lastDownloadedSegment int) time.Durat
 		return maxBuffer
 	}
 
-	return bufferLevel
+    return bufferLevel
+}
+
+// GetPlaybackStartTime retorna o instante simulado de início da reprodução
+// (start play) para o primeiro segmento. Útil para métricas como Join latency.
+func (p *PlaybackSimulator) GetPlaybackStartTime() time.Time {
+    p.mutex.Lock()
+    defer p.mutex.Unlock()
+    return p.segmentPlaybackTime[p.firstSegment]
 }
