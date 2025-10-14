@@ -146,7 +146,8 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 				remaining := time.Until(deadline)
 				if remaining <= 0 {
 					fmt.Printf("Skipped (timeout) segment %d, tile %d\n", segment, tile)
-					if statisticsLogger != nil {
+                    if statisticsLogger != nil {
+                        bufferSec := playbackSimulator.GetBufferLevel(int(lastDownloadedSegment.Load())).Seconds()
 						statisticsLogger.Log(time.Since(startTime), model.VideoPacketRequest{
 							ID:       uuid.Nil,
 							Priority: priority,
@@ -154,7 +155,7 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 							Segment:  segment,
 							Tile:     tile,
 							Timeout:  0,
-						}, 0, true, true, false, 0.0)
+                        }, 0, true, true, false, 0.0, bufferSec)
 					}
 					return
 				}
@@ -180,6 +181,7 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
                 firstRequestOnce.Do(func() { firstRequestTime = time.Now() })
 
                 // Registra o tempo de envio da requisição ANTES de enviá-la
+                sendBufferSec := playbackSimulator.GetBufferLevel(int(lastDownloadedSegment.Load())).Seconds()
                 collector.RecordSend(request.ID)
 
 				// As linhas abaixo foram removidas pois o cálculo de vazão era prematuro e com dados errados
@@ -234,10 +236,10 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 					}
 				}
 
-				if statisticsLogger != nil {
-					statisticsLogger.Log(requestTime, request,
-						responseTime-requestTime, timedOut, false, !timedOut, instaThroughput)
-				}
+                if statisticsLogger != nil {
+                    statisticsLogger.Log(requestTime, request,
+                        responseTime-requestTime, timedOut, false, !timedOut, instaThroughput, sendBufferSec)
+                }
 			}(segmentDeadline, segmentBitrate)
 		}
 	}
