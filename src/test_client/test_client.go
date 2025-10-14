@@ -25,6 +25,87 @@ const mediumPriorityRatio = 0.0
 // Proportion of high priority
 const highPriorityRatio = 0.3
 
+// Aggregator for Segment Completion Rate (ALL tiles requested)
+// Tracks, per segment, the set of required tiles and the set of tiles
+// that arrived on time (before deadline). The completion rate is the
+// percentage of segments for which all required tiles arrived on time.
+type segmentCompletionAgg struct {
+    required map[int]map[int]struct{}
+    ontime   map[int]map[int]struct{}
+    mutex    sync.Mutex
+}
+
+func newSegmentCompletionAgg() *segmentCompletionAgg {
+    return &segmentCompletionAgg{
+        required: make(map[int]map[int]struct{}),
+        ontime:   make(map[int]map[int]struct{}),
+    }
+}
+
+// SetRequired defines the required tiles for a given segment.
+func (a *segmentCompletionAgg) SetRequired(segment int, tiles []int) {
+    a.mutex.Lock()
+    defer a.mutex.Unlock()
+    s := make(map[int]struct{}, len(tiles))
+    for _, t := range tiles {
+        s[t] = struct{}{}
+    }
+    a.required[segment] = s
+}
+
+// Record marks a tile as received on time or not. Only on-time tiles are tracked
+// for completion purposes.
+func (a *segmentCompletionAgg) Record(segment, tile int, onTime bool) {
+    if !onTime {
+        return
+    }
+    a.mutex.Lock()
+    defer a.mutex.Unlock()
+    m, ok := a.ontime[segment]
+    if !ok {
+        m = make(map[int]struct{})
+        a.ontime[segment] = m
+    }
+    m[tile] = struct{}{}
+}
+
+// Rate computes the percentage of segments in [firstSegment, lastSegment]
+// for which all required tiles arrived on time.
+func (a *segmentCompletionAgg) Rate(firstSegment, lastSegment int) float64 {
+    a.mutex.Lock()
+    defer a.mutex.Unlock()
+
+    if lastSegment < firstSegment {
+        return 0.0
+    }
+
+    total := 0
+    completed := 0
+    for seg := firstSegment; seg <= lastSegment; seg++ {
+        total++
+        req, ok := a.required[seg]
+        if !ok || len(req) == 0 {
+            // If no required tiles were set, treat as not completed.
+            continue
+        }
+        got := a.ontime[seg]
+        all := true
+        for t := range req {
+            if _, ok := got[t]; !ok {
+                all = false
+                break
+            }
+        }
+        if all {
+            completed++
+        }
+    }
+    if total == 0 {
+        return 0.0
+    }
+    return 100.0 * float64(completed) / float64(total)
+}
+
 func StartTestClient(serverURL string, serverPort int, parallelism int, baseLatencyMs int) {
     client := NewClient(ClientOptions{
         Pipeline:   pipeline,
@@ -92,6 +173,9 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 	var lastDownloadedSegment atomic.Int32 // Declara como atomic.Int32
 	lastDownloadedSegment.Store(int32(firstSegment - 1)) // Inicializa de forma atômica
 
+    // Aggregator para Segment Completion Rate (ALL tiles)
+    agg := newSegmentCompletionAgg()
+
 	for iSegment := firstSegment; iSegment <= lastSegment; iSegment++ {
 		log.Printf("Processing segment %d", iSegment)
 
@@ -117,6 +201,13 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 		timeBudget += segmentDuration
 		segmentDeadline := time.Now().Add(timeBudget)
 		segmentBitrate := currentBitrate
+
+        // Define required tiles for this segment (ALL tiles requested: 1..120)
+        requiredTiles := make([]int, 120)
+        for k := 1; k <= 120; k++ {
+            requiredTiles[k-1] = k
+        }
+        agg.SetRequired(iSegment, requiredTiles)
 
 		for iTile := 1; iTile <= 120; iTile++ {
 			tile, segment := iTile, iSegment
@@ -221,6 +312,10 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 					}
 				}
 
+                // Record on-time arrival for aggregator (responseTime <= deadline)
+                onTime := (response != nil) && (!timedOut)
+                agg.Record(segment, tile, onTime)
+
 				if response != nil {
 					// Atualiza o último segmento baixado de forma atômica, apenas se o novo segmento for maior
 					for {
@@ -244,26 +339,31 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 		}
 	}
 
-    log.Println("Waiting for all goroutines to finish...")
-    wg.Wait()
-    log.Println("All goroutines completed.")
-    fmt.Println("Test iteration complete.")
+	    log.Println("Waiting for all goroutines to finish...")
+	    wg.Wait()
+	    log.Println("All goroutines completed.")
+	    fmt.Println("Test iteration complete.")
 
-    // Cálculo e registro da Join latency: tempo entre o primeiro request
-    // de mídia e o instante simulado de início do playback.
-    if !firstRequestTime.IsZero() {
-        playbackStart := playbackSimulator.GetPlaybackStartTime()
-        joinLatency := playbackStart.Sub(firstRequestTime)
-        if joinLatency < 0 {
-            joinLatency = 0
-        }
+	    // Cálculo e registro de Join latency e Segment completion rate
+	    var joinLatency time.Duration
+	    if !firstRequestTime.IsZero() {
+	        playbackStart := playbackSimulator.GetPlaybackStartTime()
+	        joinLatency = playbackStart.Sub(firstRequestTime)
+	        if joinLatency < 0 {
+	            joinLatency = 0
+	        }
+	        log.Printf("Join latency: %d ms", joinLatency.Milliseconds())
+	    } else {
+	        log.Println("Join latency: first request timestamp not captured")
+	    }
+
+        // Compute segment completion rate (ALL tiles) in percentage
+        completionRate := agg.Rate(firstSegment, lastSegment)
+        log.Printf("Segment completion rate (ALL tiles): %.2f%%", completionRate)
+
         if summaryLogger != nil {
-            summaryLogger.LogJoinLatency(joinLatency)
+            summaryLogger.LogSession(joinLatency, completionRate)
         }
-        log.Printf("Join latency: %d ms", joinLatency.Milliseconds())
-    } else {
-        log.Println("Join latency: first request timestamp not captured")
-    }
 }
 
 // metricas de rede (vazão instantanea + media)

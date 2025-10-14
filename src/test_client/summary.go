@@ -10,8 +10,8 @@ import (
     "time"
 )
 
-// SummaryLogger escreve métricas agregadas de sessão, como Join latency,
-// em um CSV separado para facilitar análise posterior.
+// SummaryLogger escreve métricas agregadas de sessão, como Join latency e
+// Segment completion rate, em um CSV separado para facilitar análise posterior.
 type SummaryLogger struct {
     fileWriter *bufio.Writer
     mutex      sync.Mutex
@@ -19,7 +19,7 @@ type SummaryLogger struct {
 }
 
 func NewSummaryLogger(path string) *SummaryLogger {
-    const header string = "join_latency_ms\n"
+    const header string = "join_latency_ms,segment_completion_rate_percent\n"
 
     file, err := os.Create(path)
     if err != nil {
@@ -37,12 +37,23 @@ func NewSummaryLogger(path string) *SummaryLogger {
     return s
 }
 
-// LogJoinLatency grava a Join latency em milissegundos.
+// LogSession grava uma linha com Join latency e Segment completion rate (%).
+func (s *SummaryLogger) LogSession(joinLatency time.Duration, segmentCompletionRatePercent float64) {
+    s.mutex.Lock()
+    defer s.mutex.Unlock()
+
+    row := fmt.Sprintf("%d,%.2f\n", joinLatency.Milliseconds(), segmentCompletionRatePercent)
+    if _, err := s.fileWriter.WriteString(row); err != nil {
+        log.Panicf("Failed to write: %s\n", err)
+    }
+}
+
+// LogJoinLatency é mantido por compatibilidade; escreve a taxa como -1.00.
 func (s *SummaryLogger) LogJoinLatency(d time.Duration) {
     s.mutex.Lock()
     defer s.mutex.Unlock()
 
-    row := fmt.Sprintf("%d\n", d.Milliseconds())
+    row := fmt.Sprintf("%d,%.2f\n", d.Milliseconds(), -1.0)
     if _, err := s.fileWriter.WriteString(row); err != nil {
         log.Panicf("Failed to write: %s\n", err)
     }
@@ -54,4 +65,3 @@ func (s *SummaryLogger) Close() {
     s.file.Close()
     s.mutex.Unlock()
 }
-
