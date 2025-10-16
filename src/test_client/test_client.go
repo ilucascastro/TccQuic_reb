@@ -32,13 +32,17 @@ const highPriorityRatio = 0.3
 type segmentCompletionAgg struct {
     required map[int]map[int]struct{}
     ontime   map[int]map[int]struct{}
+    processed map[int]map[int]struct{}
+    finalRatio map[int]float64
     mutex    sync.Mutex
 }
 
 func newSegmentCompletionAgg() *segmentCompletionAgg {
     return &segmentCompletionAgg{
-        required: make(map[int]map[int]struct{}),
-        ontime:   make(map[int]map[int]struct{}),
+        required:  make(map[int]map[int]struct{}),
+        ontime:    make(map[int]map[int]struct{}),
+        processed: make(map[int]map[int]struct{}),
+        finalRatio: make(map[int]float64),
     }
 }
 
@@ -51,22 +55,102 @@ func (a *segmentCompletionAgg) SetRequired(segment int, tiles []int) {
         s[t] = struct{}{}
     }
     a.required[segment] = s
+    a.ontime[segment] = make(map[int]struct{})
+    a.processed[segment] = make(map[int]struct{})
+    delete(a.finalRatio, segment)
 }
 
 // Record marks a tile as received on time or not. Only on-time tiles are tracked
 // for completion purposes.
-func (a *segmentCompletionAgg) Record(segment, tile int, onTime bool) {
-    if !onTime {
-        return
-    }
+func (a *segmentCompletionAgg) Record(segment, tile int, onTime bool) (float64, bool) {
     a.mutex.Lock()
     defer a.mutex.Unlock()
-    m, ok := a.ontime[segment]
+
+    req, ok := a.required[segment]
     if !ok {
-        m = make(map[int]struct{})
-        a.ontime[segment] = m
+        return -1.0, false
     }
-    m[tile] = struct{}{}
+
+    if _, exists := req[tile]; !exists {
+        // Guard against unexpected tiles; treat them as required for completeness.
+        req[tile] = struct{}{}
+    }
+
+    proc := a.processed[segment]
+    if proc == nil {
+        proc = make(map[int]struct{})
+        a.processed[segment] = proc
+    }
+
+    if _, already := proc[tile]; !already {
+        proc[tile] = struct{}{}
+
+        if onTime {
+            m := a.ontime[segment]
+            if m == nil {
+                m = make(map[int]struct{})
+                a.ontime[segment] = m
+            }
+            m[tile] = struct{}{}
+        }
+
+        if len(proc) == len(req) && len(req) > 0 {
+            onTimeCount := 0
+            if m := a.ontime[segment]; m != nil {
+                onTimeCount = len(m)
+            }
+            missing := len(req) - onTimeCount
+            ratio := float64(missing) / float64(len(req))
+            a.finalRatio[segment] = ratio
+            return ratio, true
+        }
+    } else {
+        // Tile already processed; ensure we update on-time map if status improved.
+        if onTime {
+            m := a.ontime[segment]
+            if m == nil {
+                m = make(map[int]struct{})
+                a.ontime[segment] = m
+            }
+            m[tile] = struct{}{}
+        }
+    }
+
+    if ratio, ok := a.finalRatio[segment]; ok {
+        return ratio, true
+    }
+
+    return -1.0, false
+}
+
+// TileMissingRatio returns the final ratio for the given segment if known.
+// The boolean indicates whether the segment has processed all required tiles.
+func (a *segmentCompletionAgg) TileMissingRatio(segment int) (float64, bool) {
+    a.mutex.Lock()
+    defer a.mutex.Unlock()
+
+    if ratio, ok := a.finalRatio[segment]; ok {
+        return ratio, true
+    }
+
+    req, ok := a.required[segment]
+    if !ok || len(req) == 0 {
+        return 0.0, false
+    }
+
+    proc := a.processed[segment]
+    if proc == nil || len(proc) < len(req) {
+        return -1.0, false
+    }
+
+    onTimeCount := 0
+    if m := a.ontime[segment]; m != nil {
+        onTimeCount = len(m)
+    }
+    missing := len(req) - onTimeCount
+    ratio := float64(missing) / float64(len(req))
+    a.finalRatio[segment] = ratio
+    return ratio, true
 }
 
 // Rate computes the percentage of segments in [firstSegment, lastSegment]
@@ -234,22 +318,27 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
                     wg.Done()
                 }()
 
-				remaining := time.Until(deadline)
-				if remaining <= 0 {
-					fmt.Printf("Skipped (timeout) segment %d, tile %d\n", segment, tile)
-                    if statisticsLogger != nil {
-                        bufferSec := playbackSimulator.GetBufferLevel(int(lastDownloadedSegment.Load())).Seconds()
-						statisticsLogger.Log(time.Since(startTime), model.VideoPacketRequest{
-							ID:       uuid.Nil,
-							Priority: priority,
-							Bitrate:  bitrate,
-							Segment:  segment,
-							Tile:     tile,
-							Timeout:  0,
-                        }, 0, true, true, false, 0.0, bufferSec)
-					}
-					return
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				fmt.Printf("Skipped (timeout) segment %d, tile %d\n", segment, tile)
+				ratio, complete := agg.Record(segment, tile, false)
+				tmrValue := -1.0
+				if complete {
+					tmrValue = ratio
 				}
+				if statisticsLogger != nil {
+					bufferSec := playbackSimulator.GetBufferLevel(int(lastDownloadedSegment.Load())).Seconds()
+					statisticsLogger.Log(time.Since(startTime), model.VideoPacketRequest{
+						ID:       uuid.Nil,
+						Priority: priority,
+						Bitrate:  bitrate,
+						Segment:  segment,
+						Tile:     tile,
+						Timeout:  0,
+					}, 0, true, true, false, 0.0, bufferSec, tmrValue)
+				}
+				return
+			}
 				timeoutMs := int(remaining / time.Millisecond)
 				if timeoutMs <= 0 {
 					timeoutMs = 1
@@ -312,9 +401,13 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 					}
 				}
 
-                // Record on-time arrival for aggregator (responseTime <= deadline)
-                onTime := (response != nil) && (!timedOut)
-                agg.Record(segment, tile, onTime)
+			// Record on-time arrival for aggregator (responseTime <= deadline)
+			onTime := (response != nil) && (!timedOut)
+			ratio, complete := agg.Record(segment, tile, onTime)
+			tmrValue := -1.0
+			if complete {
+				tmrValue = ratio
+			}
 
 				if response != nil {
 					// Atualiza o último segmento baixado de forma atômica, apenas se o novo segmento for maior
@@ -331,10 +424,10 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 					}
 				}
 
-                if statisticsLogger != nil {
-                    statisticsLogger.Log(requestTime, request,
-                        responseTime-requestTime, timedOut, false, !timedOut, instaThroughput, sendBufferSec)
-                }
+			if statisticsLogger != nil {
+				statisticsLogger.Log(requestTime, request,
+					responseTime-requestTime, timedOut, false, !timedOut, instaThroughput, sendBufferSec, tmrValue)
+			}
 			}(segmentDeadline, segmentBitrate)
 		}
 	}
