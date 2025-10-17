@@ -46,6 +46,41 @@ func newSegmentCompletionAgg() *segmentCompletionAgg {
     }
 }
 
+// Aggregator for stale bytes ratio (bytes received after deadline vs total bytes received).
+// Guarded by mutex because goroutines update it concurrently.
+type staleBytesAgg struct {
+    mutex      sync.Mutex
+    lateBytes  uint64
+    totalBytes uint64
+}
+
+func newStaleBytesAgg() *staleBytesAgg {
+    return &staleBytesAgg{}
+}
+
+// Add records the amount of bytes received and whether they were late.
+func (a *staleBytesAgg) Add(bytes int, late bool) {
+    if bytes <= 0 {
+        return
+    }
+    a.mutex.Lock()
+    a.totalBytes += uint64(bytes)
+    if late {
+        a.lateBytes += uint64(bytes)
+    }
+    a.mutex.Unlock()
+}
+
+// RatioPercent returns the percentage of bytes that arrived after the deadline.
+func (a *staleBytesAgg) RatioPercent() float64 {
+    a.mutex.Lock()
+    defer a.mutex.Unlock()
+    if a.totalBytes == 0 {
+        return 0.0
+    }
+    return 100.0 * float64(a.lateBytes) / float64(a.totalBytes)
+}
+
 // SetRequired defines the required tiles for a given segment.
 func (a *segmentCompletionAgg) SetRequired(segment int, tiles []int) {
     a.mutex.Lock()
@@ -259,6 +294,7 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 
     // Aggregator para Segment Completion Rate (ALL tiles)
     agg := newSegmentCompletionAgg()
+    staleAgg := newStaleBytesAgg()
 
 	for iSegment := firstSegment; iSegment <= lastSegment; iSegment++ {
 		log.Printf("Processing segment %d", iSegment)
@@ -381,6 +417,7 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 				// collector.RecordSend(request.ID)
 
 				var timedOut bool
+				var late bool
 				if response == nil {
 					fmt.Printf("Timeout: no response for segment %d, tile %d\n", segment, tile)
 					timedOut = true
@@ -390,9 +427,13 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 						log.Panicf("Empty response for (%d, %d)", segment, tile)
 					}
 					// Registra o recebimento da resposta com o tamanho correto dos dados.
-					_, instaThroughput = collector.RecordRecv(request.ID, len(response.Data)) // Atribui ao instaThroughput já declarado
+					bytesReceived := len(response.Data)
+					_, instaThroughput = collector.RecordRecv(request.ID, bytesReceived) // Atribui ao instaThroughput já declarado
 
-					if time.Now().After(deadline) {
+					late = time.Now().After(deadline)
+					staleAgg.Add(bytesReceived, late)
+
+					if late {
 						fmt.Printf("Late response for segment %d, tile %d\n", segment, tile)
 						timedOut = true
 					} else {
@@ -454,8 +495,11 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
         completionRate := agg.Rate(firstSegment, lastSegment)
         log.Printf("Segment completion rate (ALL tiles): %.2f%%", completionRate)
 
+        staleRatio := staleAgg.RatioPercent()
+        log.Printf("Stale bytes ratio: %.2f%%", staleRatio)
+
         if summaryLogger != nil {
-            summaryLogger.LogSession(joinLatency, completionRate)
+            summaryLogger.LogSession(joinLatency, completionRate, staleRatio)
         }
 }
 

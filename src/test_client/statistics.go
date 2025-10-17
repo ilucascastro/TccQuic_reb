@@ -42,7 +42,7 @@ func (s *StatisticsLogger) Log(timeFromStart time.Duration,
     skipped bool, ok bool, tp float64, bufferSec float64, tileMissingRatio float64) {
     s.mutex.Lock()
 
-    row := fmt.Sprintf("%d,%d,%d,%d,%d,%t,%t,%t,%f,%.6f,%.6f\n", timeFromStart.Nanoseconds(),
+    row := fmt.Sprintf("%d,%d,%d,%d,%d,%t,%t,%t,%f,%.2f,%.2f\n", timeFromStart.Nanoseconds(),
         r.Segment, r.Tile, r.Priority, latency.Nanoseconds(), timedOut, skipped, ok, tp, bufferSec, tileMissingRatio)
 
 	if _, err := s.fileWriter.WriteString(row); err != nil {
