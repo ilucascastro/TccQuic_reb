@@ -8,6 +8,7 @@ import (
 	"main/src/model"
 	"main/src/test_client/netstats"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic" // Adiciona o import para sync/atomic
 	"time"
@@ -24,6 +25,11 @@ const mediumPriorityRatio = 0.0
 
 // Proportion of high priority
 const highPriorityRatio = 0.3
+
+const (
+	defaultFOVTracePath = "data/user_fov.csv"
+	defaultFOVTraceFPS  = 30
+)
 
 // Aggregator for Segment Completion Rate (ALL tiles requested)
 // Tracks, per segment, the set of required tiles and the set of tiles
@@ -226,11 +232,11 @@ func (a *segmentCompletionAgg) Rate(firstSegment, lastSegment int) float64 {
 }
 
 func StartTestClient(serverURL string, serverPort int, parallelism int, baseLatencyMs int) {
-    client := NewClient(ClientOptions{
-        Pipeline:   pipeline,
-        ServerURL:  serverURL,
-        ServerPort: serverPort,
-    })
+	client := NewClient(ClientOptions{
+		Pipeline:   pipeline,
+		ServerURL:  serverURL,
+		ServerPort: serverPort,
+	})
 
 	log.Println("Base latency =", baseLatencyMs)
 
@@ -240,77 +246,105 @@ func StartTestClient(serverURL string, serverPort int, parallelism int, baseLate
 		return
 	}
 
-    statisticsPath := fmt.Sprintf("statistics-%d.csv", os.Getpid())
-    summaryPath := fmt.Sprintf("statistics-summary-%d.csv", os.Getpid())
+	segmentDuration := 1 * time.Second
+	fovPath := os.Getenv("FOV_TRACE_PATH")
+	if fovPath == "" {
+		fovPath = defaultFOVTracePath
+	}
 
-    statisticsLogger := NewStatisticsLogger(statisticsPath)
-    summaryLogger := NewSummaryLogger(summaryPath)
-    runTestIteration(client, parallelism, baseLatencyMs, statisticsLogger, summaryLogger)
-    statisticsLogger.Close()
-    summaryLogger.Close()
+	fps := defaultFOVTraceFPS
+	if envFPS := os.Getenv("FOV_TRACE_FPS"); envFPS != "" {
+		if parsed, parseErr := strconv.Atoi(envFPS); parseErr == nil && parsed > 0 {
+			fps = parsed
+		} else {
+			log.Printf("Invalid FOV_TRACE_FPS=%q, falling back to default %d", envFPS, defaultFOVTraceFPS)
+		}
+	}
+
+	var fovTrace *FOVTrace
+	if trace, traceErr := LoadFOVTrace(fovPath, fps, segmentDuration); traceErr != nil {
+		log.Printf("Failed to load FOV trace from %s: %v (continuing without FOV prioritisation)", fovPath, traceErr)
+	} else {
+		fovTrace = trace
+		log.Printf("Loaded FOV trace: fps=%d, segments=%d", fps, fovTrace.MaxSegment())
+	}
+
+	statisticsPath := fmt.Sprintf("statistics-%d.csv", os.Getpid())
+	summaryPath := fmt.Sprintf("statistics-summary-%d.csv", os.Getpid())
+
+	statisticsLogger := NewStatisticsLogger(statisticsPath)
+	summaryLogger := NewSummaryLogger(summaryPath)
+	runTestIteration(client, parallelism, baseLatencyMs, statisticsLogger, summaryLogger, segmentDuration, fovTrace)
+	statisticsLogger.Close()
+	summaryLogger.Close()
 }
 
 func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
-    statisticsLogger *StatisticsLogger, summaryLogger *SummaryLogger) {
-    var wg sync.WaitGroup
+	statisticsLogger *StatisticsLogger, summaryLogger *SummaryLogger, segmentDuration time.Duration, fovTrace *FOVTrace) {
+	var wg sync.WaitGroup
 
-    startTime := time.Now()
+	startTime := time.Now()
 
-	segmentDuration := 1 * time.Second
 	baseLatency := time.Duration(baseLatencyMs) * time.Millisecond
-	firstSegment := 100
-	lastSegment := 177
+	firstTile := 100
+	lastTile := 177
+
 	playbackSimulator := NewPlaybackSimulator(
 		segmentDuration,
 		baseLatency,
-		firstSegment,
-		lastSegment,
+		firstTile,
+		lastTile,
 	)
-
-	//counter := 0
-	//counterMediumPriority := 0
-	//counterHighPriority := 0
-	// Comentado: Variáveis de contador para prioridade, não usadas no ABR v1.0
-	// counter := 0
-	// counterMediumPriority := 0
-	// counterHighPriority := 0
 
 	parallelismSemaphore := NewSemaphore(parallelism)
 
-	log.Printf("Starting test iteration for segments %d to %d", firstSegment, lastSegment)
+	log.Printf("Starting test iteration for tiles %d to %d", firstTile, lastTile)
 	fmt.Printf("Test started with parallelism = %d\n", parallelism)
 
-    playbackSimulator.Start()
+	playbackSimulator.Start()
 
-    // Captura do timestamp do primeiro request de mídia
-    var firstRequestOnce sync.Once
-    var firstRequestTime time.Time
+	var firstRequestOnce sync.Once
+	var firstRequestTime time.Time
 
-	// Inicia o pacote de coleta de dados da rede com uma window size
-	collector := netstats.New(120)
-	currentBitrate := model.HIGH_BITRATE // Inicializa a taxa de bits com o valor mais alto
-	var lastDownloadedSegment atomic.Int32 // Declara como atomic.Int32
-	lastDownloadedSegment.Store(int32(firstSegment - 1)) // Inicializa de forma atômica
+	const totalTimeSegments = 120
 
-    // Aggregator para Segment Completion Rate (ALL tiles)
-    agg := newSegmentCompletionAgg()
-    staleAgg := newStaleBytesAgg()
+	collector := netstats.New(totalTimeSegments)
+	currentBitrate := model.HIGH_BITRATE
+	var lastDownloadedSegment atomic.Int32
+	lastDownloadedSegment.Store(int32(firstTile - 1))
 
-	for iSegment := firstSegment; iSegment <= lastSegment; iSegment++ {
-		log.Printf("Processing segment %d", iSegment)
+	agg := newSegmentCompletionAgg()
+	aggFOV := newSegmentCompletionAgg()
+	staleAgg := newStaleBytesAgg()
 
-		// ABR logic: Adapt bitrate based on average throughput and buffer level
+	lastFOVSegment := 0
+	if fovTrace != nil {
+		lastFOVSegment = fovTrace.MaxSegment()
+		if lastFOVSegment > totalTimeSegments {
+			lastFOVSegment = totalTimeSegments
+		}
+		if lastFOVSegment < 0 {
+			lastFOVSegment = 0
+		}
+	}
+	for segIdx := 1; segIdx <= totalTimeSegments; segIdx++ {
+		var tiles []int
+		if fovTrace != nil {
+			tiles = fovTrace.TilesForSegment(segIdx)
+		}
+		aggFOV.SetRequired(segIdx, tiles)
+	}
+
+	for tileID := firstTile; tileID <= lastTile; tileID++ {
+		log.Printf("Processing tile %d", tileID)
+
 		avgThroughput := collector.AvgThroughput()
-		// Lê o valor de lastDownloadedSegment de forma atômica
 		bufferLevel := playbackSimulator.GetBufferLevel(int(lastDownloadedSegment.Load()))
 		currentBitrate = adaptBitrateWithBuffer(avgThroughput, bufferLevel)
 		log.Printf("ABR: Average Throughput = %.2f, Buffer Level = %.2f s, Selected Bitrate = %d", avgThroughput, bufferLevel.Seconds(), currentBitrate)
 
-        // Em vez de esperar o início da reprodução do próprio segmento,
-        // aguardamos apenas até que o segmento esteja dentro da janela de
-        // pré-buffer permitida. Isso permite pré-carregar e construir buffer.
-        playbackSimulator.WaitUntilWithinPrefetchWindow(iSegment)
-		timeBudget := playbackSimulator.GetTimeToReceive(iSegment)
+		playbackSimulator.WaitUntilWithinPrefetchWindow(tileID)
+		timeBudget := playbackSimulator.GetTimeToReceive(tileID)
 		if timeBudget <= 0 {
 			timeBudget = segmentDuration
 		}
@@ -319,188 +353,170 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 			timeBudget = maxAhead
 		}
 		timeBudget += segmentDuration
-		segmentDeadline := time.Now().Add(timeBudget)
+		tileDeadline := time.Now().Add(timeBudget)
 		segmentBitrate := currentBitrate
 
-        // Define required tiles for this segment (ALL tiles requested: 1..120)
-        requiredTiles := make([]int, 120)
-        for k := 1; k <= 120; k++ {
-            requiredTiles[k-1] = k
-        }
-        agg.SetRequired(iSegment, requiredTiles)
+		requiredSegments := make([]int, totalTimeSegments)
+		for k := 1; k <= totalTimeSegments; k++ {
+			requiredSegments[k-1] = k
+		}
+		agg.SetRequired(tileID, requiredSegments)
 
-		for iTile := 1; iTile <= 120; iTile++ {
-			tile, segment := iTile, iSegment
+		for timeSegment := 1; timeSegment <= totalTimeSegments; timeSegment++ {
+			inFOV := fovTrace != nil && fovTrace.Contains(timeSegment, tileID)
 
-			//priority := model.LOW_PRIORITY
-			priority := model.LOW_PRIORITY // Prioridade fixada para LOW no ABR v1.0
-
-			// Comentado: Lógica de classificação de prioridade, não usada no ABR v1.0
-			// if float64(counterHighPriority)/float64(counter+1) < highPriorityRatio {
-			// 	priority = model.HIGH_PRIORITY
-			// 	counterHighPriority++
-			// } else if float64(counterMediumPriority)/float64(counter+1) < mediumPriorityRatio {
-			// 	priority = model.MEDIUM_PRIORITY
-			// 	counterMediumPriority++
-			// }
-			// counter++
+			priority := model.LOW_PRIORITY
+			requestBitrate := model.LOW_BITRATE
+			if inFOV {
+				priority = model.HIGH_PRIORITY
+				requestBitrate = segmentBitrate
+			}
 
 			parallelismSemaphore.Acquire()
 			wg.Add(1)
 
-            go func(deadline time.Time, bitrate model.Bitrate) {
-                defer func() {
-                    parallelismSemaphore.Release()
-                    wg.Done()
-                }()
+			go func(tileID, timeSegment int, deadline time.Time, bitrate model.Bitrate, priority model.Priority, inFOV bool) {
+				defer func() {
+					parallelismSemaphore.Release()
+					wg.Done()
+				}()
 
-			remaining := time.Until(deadline)
-			if remaining <= 0 {
-				fmt.Printf("Skipped (timeout) segment %d, tile %d\n", segment, tile)
-				ratio, complete := agg.Record(segment, tile, false)
-				tmrValue := -1.0
-				if complete {
-					tmrValue = ratio
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					ratio, complete := agg.Record(tileID, timeSegment, false)
+					tmrValue := -1.0
+					if complete {
+						tmrValue = ratio
+					}
+					aggFOV.Record(timeSegment, tileID, false)
+					if statisticsLogger != nil {
+						bufferSec := playbackSimulator.GetBufferLevel(int(lastDownloadedSegment.Load())).Seconds()
+						statisticsLogger.Log(time.Since(startTime), model.VideoPacketRequest{
+							ID:       uuid.Nil,
+							Priority: priority,
+							Bitrate:  bitrate,
+							Segment:  tileID,
+							Tile:     timeSegment,
+							Timeout:  0,
+						}, 0, true, true, false, 0.0, bufferSec, tmrValue, inFOV)
+					}
+					return
 				}
-				if statisticsLogger != nil {
-					bufferSec := playbackSimulator.GetBufferLevel(int(lastDownloadedSegment.Load())).Seconds()
-					statisticsLogger.Log(time.Since(startTime), model.VideoPacketRequest{
-						ID:       uuid.Nil,
-						Priority: priority,
-						Bitrate:  bitrate,
-						Segment:  segment,
-						Tile:     tile,
-						Timeout:  0,
-					}, 0, true, true, false, 0.0, bufferSec, tmrValue)
-				}
-				return
-			}
+
 				timeoutMs := int(remaining / time.Millisecond)
 				if timeoutMs <= 0 {
 					timeoutMs = 1
 				}
-				var instaThroughput float64 // Declara instaThroughput aqui para ter o escopo correto
+				var instaThroughput float64
 
 				request := model.VideoPacketRequest{
 					ID:       uuid.Must(uuid.New(), nil),
 					Priority: priority,
 					Bitrate:  bitrate,
-					Segment:  segment,
-					Tile:     tile,
+					Segment:  tileID,
+					Tile:     timeSegment,
 					Timeout:  timeoutMs,
 				}
 
-                // Log de envio da requisição
-                fmt.Printf("Sending request for segment %d, tile %d with priority %d\n", segment, tile, priority)
+				fmt.Printf("Sending request for tile %d, segment %d (priority=%d, FOV=%t)\n", tileID, timeSegment, priority, inFOV)
 
-                // Marca o primeiro request de mídia (Join latency: t0)
-                firstRequestOnce.Do(func() { firstRequestTime = time.Now() })
+				firstRequestOnce.Do(func() { firstRequestTime = time.Now() })
 
-                // Registra o tempo de envio da requisição ANTES de enviá-la
-                sendBufferSec := playbackSimulator.GetBufferLevel(int(lastDownloadedSegment.Load())).Seconds()
-                collector.RecordSend(request.ID)
-
-				// As linhas abaixo foram removidas pois o cálculo de vazão era prematuro e com dados errados
-				// requestBytes, err := json.Marshal(request)
-				// if err != nil {
-				// 	return
-				// }
-				// sizeInBytes := len(requestBytes)
-				// _, instaThroughput := collector.RecordRecv(request.ID, sizeInBytes)
+				sendBufferSec := playbackSimulator.GetBufferLevel(int(lastDownloadedSegment.Load())).Seconds()
+				collector.RecordSend(request.ID)
 
 				requestTime := time.Since(startTime)
 				response := client.Request(request, remaining)
 				responseTime := time.Since(startTime)
 
-				// A chamada para collector.RecordSend foi movida para antes do request.
-				// Esta linha original é agora redundante e deve ser removida/comentada.
-				// collector.RecordSend(request.ID)
-
 				var timedOut bool
 				var late bool
 				if response == nil {
-					fmt.Printf("Timeout: no response for segment %d, tile %d\n", segment, tile)
+					fmt.Printf("Timeout: no response for tile %d, segment %d\n", tileID, timeSegment)
 					timedOut = true
-					instaThroughput = 0.0 // Define como 0.0 para caso de timeout
+					instaThroughput = 0.0
 				} else {
 					if len(response.Data) == 0 {
-						log.Panicf("Empty response for (%d, %d)", segment, tile)
+						log.Panicf("Empty response for (%d, %d)", tileID, timeSegment)
 					}
-					// Registra o recebimento da resposta com o tamanho correto dos dados.
 					bytesReceived := len(response.Data)
-					_, instaThroughput = collector.RecordRecv(request.ID, bytesReceived) // Atribui ao instaThroughput já declarado
+					_, instaThroughput = collector.RecordRecv(request.ID, bytesReceived)
 
 					late = time.Now().After(deadline)
 					staleAgg.Add(bytesReceived, late)
 
 					if late {
-						fmt.Printf("Late response for segment %d, tile %d\n", segment, tile)
+						fmt.Printf("Late response for tile %d, segment %d\n", tileID, timeSegment)
 						timedOut = true
 					} else {
-						fmt.Printf("Received response for segment %d, tile %d\n", segment, tile)
+						fmt.Printf("Received response for tile %d, segment %d\n", tileID, timeSegment)
 						timedOut = false
 					}
 				}
 
-			// Record on-time arrival for aggregator (responseTime <= deadline)
-			onTime := (response != nil) && (!timedOut)
-			ratio, complete := agg.Record(segment, tile, onTime)
-			tmrValue := -1.0
-			if complete {
-				tmrValue = ratio
-			}
+				onTime := (response != nil) && (!timedOut)
+				ratio, complete := agg.Record(tileID, timeSegment, onTime)
+				tmrValue := -1.0
+				if complete {
+					tmrValue = ratio
+				}
+				aggFOV.Record(timeSegment, tileID, onTime)
 
 				if response != nil {
-					// Atualiza o último segmento baixado de forma atômica, apenas se o novo segmento for maior
 					for {
 						oldValue := lastDownloadedSegment.Load()
-						if int32(segment) > oldValue {
-							if lastDownloadedSegment.CompareAndSwap(oldValue, int32(segment)) {
-								break // Atualizado com sucesso
+						if int32(tileID) > oldValue {
+							if lastDownloadedSegment.CompareAndSwap(oldValue, int32(tileID)) {
+								break
 							}
-							// Se CompareAndSwap falhou, outro goroutine atualizou, tenta novamente
 						} else {
-							break // Segmento atual não é maior, não precisa atualizar
+							break
 						}
 					}
 				}
 
-			if statisticsLogger != nil {
-				statisticsLogger.Log(requestTime, request,
-					responseTime-requestTime, timedOut, false, !timedOut, instaThroughput, sendBufferSec, tmrValue)
-			}
-			}(segmentDeadline, segmentBitrate)
+				if statisticsLogger != nil {
+					statisticsLogger.Log(requestTime, request,
+						responseTime-requestTime, timedOut, false, !timedOut, instaThroughput, sendBufferSec, tmrValue, inFOV)
+				}
+			}(tileID, timeSegment, tileDeadline, requestBitrate, priority, inFOV)
 		}
 	}
 
-	    log.Println("Waiting for all goroutines to finish...")
-	    wg.Wait()
-	    log.Println("All goroutines completed.")
-	    fmt.Println("Test iteration complete.")
+	log.Println("Waiting for all goroutines to finish...")
+	wg.Wait()
+	log.Println("All goroutines completed.")
+	fmt.Println("Test iteration complete.")
 
-	    // Cálculo e registro de Join latency e Segment completion rate
-	    var joinLatency time.Duration
-	    if !firstRequestTime.IsZero() {
-	        playbackStart := playbackSimulator.GetPlaybackStartTime()
-	        joinLatency = playbackStart.Sub(firstRequestTime)
-	        if joinLatency < 0 {
-	            joinLatency = 0
-	        }
-	        log.Printf("Join latency: %d ms", joinLatency.Milliseconds())
-	    } else {
-	        log.Println("Join latency: first request timestamp not captured")
-	    }
+	var joinLatency time.Duration
+	if !firstRequestTime.IsZero() {
+		playbackStart := playbackSimulator.GetPlaybackStartTime()
+		joinLatency = playbackStart.Sub(firstRequestTime)
+		if joinLatency < 0 {
+			joinLatency = 0
+		}
+		log.Printf("Join latency: %d ms", joinLatency.Milliseconds())
+	} else {
+		log.Println("Join latency: first request timestamp not captured")
+	}
 
-        // Compute segment completion rate (ALL tiles) in percentage
-        completionRate := agg.Rate(firstSegment, lastSegment)
-        log.Printf("Segment completion rate (ALL tiles): %.2f%%", completionRate)
+	completionRate := agg.Rate(firstTile, lastTile)
+	log.Printf("Segment completion rate (ALL tiles): %.2f%%", completionRate)
 
-        staleRatio := staleAgg.RatioPercent()
-        log.Printf("Stale bytes ratio: %.2f%%", staleRatio)
+	fovCompletionRate := -1.0
+	if lastFOVSegment > 0 {
+		fovCompletionRate = aggFOV.Rate(1, lastFOVSegment)
+		log.Printf("Segment completion rate (FOV tiles): %.2f%%", fovCompletionRate)
+	} else {
+		log.Println("Segment completion rate (FOV tiles): N/A (no FOV trace)")
+	}
 
-        if summaryLogger != nil {
-            summaryLogger.LogSession(joinLatency, completionRate, staleRatio)
-        }
+	staleRatio := staleAgg.RatioPercent()
+	log.Printf("Stale bytes ratio: %.2f%%", staleRatio)
+
+	if summaryLogger != nil {
+		summaryLogger.LogSession(joinLatency, completionRate, fovCompletionRate, staleRatio)
+	}
 }
 
 // metricas de rede (vazão instantanea + media)
