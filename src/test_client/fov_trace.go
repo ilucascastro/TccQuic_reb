@@ -9,21 +9,21 @@ import (
 	"time"
 )
 
-// FOVTrace holds the mapping between media segments (time) and the tiles that
-// were inside the user's field of view for that period.
+// O FOVTrace armazena o mapeamento entre segmentos de mídia (tempo) e os tiles que
+// estavam dentro do campo de visão do usuário durante esse período.
 type FOVTrace struct {
 	framesPerSegment int
 	tilesBySegment   map[int]map[int]struct{}
 	maxSegment       int
 }
 
-// LoadFOVTrace parses a CSV trace with the following format:
-//   no. frames, tile numbers
-//   00001, 49, 50, ...
+// LoadFOVTrace analisa um rastreamento CSV com o seguinte formato:
+// nº de quadros, números de blocos
+// 00001, 49, 50, ...
 //
-// The first column is the frame number (1-indexed), the remaining columns are
-// tile identifiers seen inside the FOV. The loader groups frames according to
-// fps and segmentDuration to obtain the list of tiles per media segment.
+// A primeira coluna é o número do quadro (indexado a partir de 1), as colunas restantes são
+// identificadores de tiles vistos dentro do campo de visão. O carregador agrupa os quadros de acordo com
+// fps e duração do segmento para obter a lista de blocos por segmento de mídia.
 func LoadFOVTrace(path string, fps int, segmentDuration time.Duration) (*FOVTrace, error) {
 	if fps <= 0 {
 		return nil, fmt.Errorf("invalid fps=%d", fps)
@@ -115,9 +115,9 @@ func LoadFOVTrace(path string, fps int, segmentDuration time.Duration) (*FOVTrac
 	return trace, nil
 }
 
-// TilesForSegment returns a slice with the tiles that were inside the FOV for
-// the provided media segment index. The slice is a copy and can be modified by
-// the caller.
+// TilesForSegment retorna uma slice com os tiles que estavam dentro do campo de visão (FOV) para
+// o índice do segmento de mídia fornecido. A slice é uma cópia e pode ser modificada por
+// quem a chamou.
 func (t *FOVTrace) TilesForSegment(segment int) []int {
 	if t == nil || segment <= 0 {
 		return nil
@@ -133,8 +133,8 @@ func (t *FOVTrace) TilesForSegment(segment int) []int {
 	return result
 }
 
-// Contains reports whether the provided tile was inside the FOV for the given
-// media segment index.
+// Contém informações sobre se o tile fornecido estava dentro do campo de visão (FOV) para o índice de segmento de mídia fornecido.
+//
 func (t *FOVTrace) Contains(segment int, tile int) bool {
 	if t == nil || segment <= 0 {
 		return false

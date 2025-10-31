@@ -19,7 +19,7 @@ type SummaryLogger struct {
 }
 
 func NewSummaryLogger(path string) *SummaryLogger {
-	const header string = "join_latency_ms,segment_completion_rate_percent,segment_completion_rate_fov_percent,stale_bytes_ratio_percent\n"
+	const header string = "join_latency_ms,segment_completion_rate_percent,segment_completion_rate_fov_percent,stale_bytes_ratio_percent,deadline_miss_rate_fov_percent,deadline_miss_rate_nonfov_percent,fov_hit_rate_delivery_percent,useful_goodput_fov_kbps\n"
 
     file, err := os.Create(path)
     if err != nil {
@@ -38,11 +38,11 @@ func NewSummaryLogger(path string) *SummaryLogger {
 }
 
 // LogSession grava uma linha com Join latency, Segment completion rate (%) e Stale bytes ratio (%).
-func (s *SummaryLogger) LogSession(joinLatency time.Duration, segmentCompletionRatePercent float64, fovCompletionRatePercent float64, staleBytesRatioPercent float64) {
+func (s *SummaryLogger) LogSession(joinLatency time.Duration, segmentCompletionRatePercent float64, fovCompletionRatePercent float64, staleBytesRatioPercent float64, deadlineMissRateFOV float64, deadlineMissRateNonFOV float64, fovHitRate float64, usefulGoodputKbps float64) {
     s.mutex.Lock()
     defer s.mutex.Unlock()
 
-    row := fmt.Sprintf("%d,%.2f,%.2f,%.2f\n", joinLatency.Milliseconds(), segmentCompletionRatePercent, fovCompletionRatePercent, staleBytesRatioPercent)
+	row := fmt.Sprintf("%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n", joinLatency.Milliseconds(), segmentCompletionRatePercent, fovCompletionRatePercent, staleBytesRatioPercent, deadlineMissRateFOV, deadlineMissRateNonFOV, fovHitRate, usefulGoodputKbps)
     if _, err := s.fileWriter.WriteString(row); err != nil {
         log.Panicf("Failed to write: %s\n", err)
     }
@@ -53,7 +53,7 @@ func (s *SummaryLogger) LogJoinLatency(d time.Duration) {
     s.mutex.Lock()
     defer s.mutex.Unlock()
 
-    row := fmt.Sprintf("%d,%.2f,%.2f,%.2f\n", d.Milliseconds(), -1.0, -1.0, -1.0)
+	row := fmt.Sprintf("%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n", d.Milliseconds(), -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0)
     if _, err := s.fileWriter.WriteString(row); err != nil {
         log.Panicf("Failed to write: %s\n", err)
     }

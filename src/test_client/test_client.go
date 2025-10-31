@@ -3,11 +3,13 @@
 package test_client
 
 import (
+	"bufio"
 	"fmt"
 	"log"
 	"main/src/model"
 	"main/src/test_client/netstats"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic" // Adiciona o import para sync/atomic
@@ -55,13 +57,13 @@ func newSegmentCompletionAgg() *segmentCompletionAgg {
 // Aggregator for stale bytes ratio (bytes received after deadline vs total bytes received).
 // Guarded by mutex because goroutines update it concurrently.
 type staleBytesAgg struct {
-    mutex      sync.Mutex
-    lateBytes  uint64
-    totalBytes uint64
+	mutex      sync.Mutex
+	lateBytes  uint64
+	totalBytes uint64
 }
 
 func newStaleBytesAgg() *staleBytesAgg {
-    return &staleBytesAgg{}
+	return &staleBytesAgg{}
 }
 
 // Add records the amount of bytes received and whether they were late.
@@ -79,12 +81,226 @@ func (a *staleBytesAgg) Add(bytes int, late bool) {
 
 // RatioPercent returns the percentage of bytes that arrived after the deadline.
 func (a *staleBytesAgg) RatioPercent() float64 {
-    a.mutex.Lock()
-    defer a.mutex.Unlock()
-    if a.totalBytes == 0 {
-        return 0.0
-    }
-    return 100.0 * float64(a.lateBytes) / float64(a.totalBytes)
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	if a.totalBytes == 0 {
+		return 0.0
+	}
+	return 100.0 * float64(a.lateBytes) / float64(a.totalBytes)
+}
+
+// Aggregator for deadline misses per tile class (FOV vs non-FOV).
+type tileDeadlineMissAgg struct {
+	mutex         sync.Mutex
+	totalFOV      uint64
+	missFOV       uint64
+	totalNonFOV   uint64
+	missNonFOV    uint64
+}
+
+func newTileDeadlineMissAgg() *tileDeadlineMissAgg {
+	return &tileDeadlineMissAgg{}
+}
+
+func (a *tileDeadlineMissAgg) Add(isFOV bool, missed bool) {
+	a.mutex.Lock()
+	if isFOV {
+		a.totalFOV++
+		if missed {
+			a.missFOV++
+		}
+	} else {
+		a.totalNonFOV++
+		if missed {
+			a.missNonFOV++
+		}
+	}
+	a.mutex.Unlock()
+}
+
+func (a *tileDeadlineMissAgg) Rates() (float64, float64) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	var fovRate float64
+	if a.totalFOV > 0 {
+		fovRate = 100.0 * float64(a.missFOV) / float64(a.totalFOV)
+	}
+
+	var nonFOVRate float64
+	if a.totalNonFOV > 0 {
+		nonFOVRate = 100.0 * float64(a.missNonFOV) / float64(a.totalNonFOV)
+	}
+
+	return fovRate, nonFOVRate
+}
+
+// Aggregator for FoV hit rate per segment.
+type fovHitAgg struct {
+	mutex   sync.Mutex
+	total   map[int]uint64
+	onTime  map[int]uint64
+}
+
+func newFovHitAgg() *fovHitAgg {
+	return &fovHitAgg{
+		total:  make(map[int]uint64),
+		onTime: make(map[int]uint64),
+	}
+}
+
+func (a *fovHitAgg) Add(segment int, inFOV bool, onTime bool) {
+	if !inFOV || segment <= 0 {
+		return
+	}
+	a.mutex.Lock()
+	a.total[segment]++
+	if onTime {
+		a.onTime[segment]++
+	}
+	a.mutex.Unlock()
+}
+
+func (a *fovHitAgg) RateOverall() float64 {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	var total uint64
+	var hit uint64
+	for seg, cnt := range a.total {
+		if cnt == 0 {
+			continue
+		}
+		total += cnt
+		hit += a.onTime[seg]
+	}
+	if total == 0 {
+		return 0.0
+	}
+	return 100.0 * float64(hit) / float64(total)
+}
+
+type fovHitSample struct {
+	Segment int
+	Total   uint64
+	OnTime  uint64
+	Rate    float64
+}
+
+func (a *fovHitAgg) Series(firstSegment, lastSegment int) []fovHitSample {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	if lastSegment < firstSegment {
+		return nil
+	}
+	series := make([]fovHitSample, 0, lastSegment-firstSegment+1)
+	for seg := firstSegment; seg <= lastSegment; seg++ {
+		total := a.total[seg]
+		if total == 0 {
+			continue
+		}
+		onTime := a.onTime[seg]
+		rate := 0.0
+		if onTime > 0 {
+			rate = 100.0 * float64(onTime) / float64(total)
+		}
+		series = append(series, fovHitSample{
+			Segment: seg,
+			Total:   total,
+			OnTime:  onTime,
+			Rate:    rate,
+		})
+	}
+	return series
+}
+
+type fovGoodputAgg struct {
+	mutex       sync.Mutex
+	window      time.Duration
+	totalBytes  uint64
+	buckets     map[int64]uint64
+}
+
+func newFovGoodputAgg(window time.Duration) *fovGoodputAgg {
+	return &fovGoodputAgg{
+		window:  window,
+		buckets: make(map[int64]uint64),
+	}
+}
+
+func (a *fovGoodputAgg) Add(at time.Duration, bytes int, inFOV bool, onTime bool) {
+	if !inFOV || !onTime || bytes <= 0 {
+		return
+	}
+	a.mutex.Lock()
+	a.totalBytes += uint64(bytes)
+	var bucket int64
+	if a.window > 0 {
+		bucket = int64(at / a.window)
+	}
+	a.buckets[bucket] += uint64(bytes)
+	a.mutex.Unlock()
+}
+
+func (a *fovGoodputAgg) OverallKbps(elapsed time.Duration) float64 {
+	if elapsed <= 0 {
+		return 0.0
+	}
+	a.mutex.Lock()
+	total := a.totalBytes
+	a.mutex.Unlock()
+	return (8.0 * float64(total)) / (elapsed.Seconds() * 1000.0)
+}
+
+type fovGoodputSample struct {
+	WindowStart time.Duration
+	WindowEnd   time.Duration
+	Bytes       uint64
+	Kbps        float64
+}
+
+func (a *fovGoodputAgg) Series() []fovGoodputSample {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	if len(a.buckets) == 0 {
+		return nil
+	}
+	keys := make([]int64, 0, len(a.buckets))
+	for bucket := range a.buckets {
+		keys = append(keys, bucket)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+	window := a.window
+	samples := make([]fovGoodputSample, 0, len(keys))
+
+	if window <= 0 {
+		bytes := a.totalBytes
+		samples = append(samples, fovGoodputSample{
+			WindowStart: 0,
+			WindowEnd:   0,
+			Bytes:       bytes,
+			Kbps:        0.0,
+		})
+		return samples
+	}
+
+	for _, bucket := range keys {
+		bytes := a.buckets[bucket]
+		start := time.Duration(bucket) * window
+		end := start + window
+		kbps := 0.0
+		if window > 0 {
+			kbps = (8.0 * float64(bytes)) / (window.Seconds() * 1000.0)
+		}
+		samples = append(samples, fovGoodputSample{
+			WindowStart: start,
+			WindowEnd:   end,
+			Bytes:       bytes,
+			Kbps:        kbps,
+		})
+	}
+
+	return samples
 }
 
 // SetRequired defines the required tiles for a given segment.
@@ -207,12 +423,12 @@ func (a *segmentCompletionAgg) Rate(firstSegment, lastSegment int) float64 {
     total := 0
     completed := 0
     for seg := firstSegment; seg <= lastSegment; seg++ {
-        total++
         req, ok := a.required[seg]
         if !ok || len(req) == 0 {
             // If no required tiles were set, treat as not completed.
             continue
         }
+        total++
         got := a.ontime[seg]
         all := true
         for t := range req {
@@ -229,6 +445,78 @@ func (a *segmentCompletionAgg) Rate(firstSegment, lastSegment int) float64 {
         return 0.0
     }
     return 100.0 * float64(completed) / float64(total)
+}
+
+func filterTilesInRange(tiles []int, min, max int) []int {
+    if len(tiles) == 0 {
+        return nil
+    }
+    filtered := make([]int, 0, len(tiles))
+    for _, tile := range tiles {
+        if tile >= min && tile <= max {
+            filtered = append(filtered, tile)
+        }
+    }
+    if len(filtered) == 0 {
+        return nil
+    }
+    return filtered
+}
+
+func writeFOVDeliverySeries(path string, samples []fovHitSample) {
+	if path == "" {
+		return
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		log.Printf("Failed to create %s: %v", path, err)
+		return
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+	defer writer.Flush()
+
+	if _, err := writer.WriteString("segment,fov_tiles,fov_on_time,fov_hit_rate_percent\n"); err != nil {
+		log.Printf("Failed to write header to %s: %v", path, err)
+		return
+	}
+
+	for _, sample := range samples {
+		if _, err := fmt.Fprintf(writer, "%d,%d,%d,%.2f\n", sample.Segment, sample.Total, sample.OnTime, sample.Rate); err != nil {
+			log.Printf("Failed to write sample to %s: %v", path, err)
+			return
+		}
+	}
+}
+
+func writeFOVGoodputSeries(path string, samples []fovGoodputSample) {
+	if path == "" {
+		return
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		log.Printf("Failed to create %s: %v", path, err)
+		return
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+	defer writer.Flush()
+
+	if _, err := writer.WriteString("window_start_s,window_end_s,fov_on_time_bytes,useful_goodput_kbps\n"); err != nil {
+		log.Printf("Failed to write header to %s: %v", path, err)
+		return
+	}
+
+	for _, sample := range samples {
+		startSec := sample.WindowStart.Seconds()
+		endSec := sample.WindowEnd.Seconds()
+		if _, err := fmt.Fprintf(writer, "%.3f,%.3f,%d,%.2f\n", startSec, endSec, sample.Bytes, sample.Kbps); err != nil {
+			log.Printf("Failed to write sample to %s: %v", path, err)
+			return
+		}
+	}
 }
 
 func StartTestClient(serverURL string, serverPort int, parallelism int, baseLatencyMs int) {
@@ -271,34 +559,42 @@ func StartTestClient(serverURL string, serverPort int, parallelism int, baseLate
 
 	statisticsPath := fmt.Sprintf("statistics-%d.csv", os.Getpid())
 	summaryPath := fmt.Sprintf("statistics-summary-%d.csv", os.Getpid())
+	fovDeliveryPath := fmt.Sprintf("fov-delivery-%d.csv", os.Getpid())
+	fovGoodputPath := fmt.Sprintf("fov-goodput-%d.csv", os.Getpid())
 
 	statisticsLogger := NewStatisticsLogger(statisticsPath)
 	summaryLogger := NewSummaryLogger(summaryPath)
-	runTestIteration(client, parallelism, baseLatencyMs, statisticsLogger, summaryLogger, segmentDuration, fovTrace)
+	runTestIteration(client, parallelism, baseLatencyMs, statisticsLogger, summaryLogger, segmentDuration, fovTrace, fovDeliveryPath, fovGoodputPath)
 	statisticsLogger.Close()
 	summaryLogger.Close()
 }
 
 func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
-	statisticsLogger *StatisticsLogger, summaryLogger *SummaryLogger, segmentDuration time.Duration, fovTrace *FOVTrace) {
+	statisticsLogger *StatisticsLogger, summaryLogger *SummaryLogger, segmentDuration time.Duration, fovTrace *FOVTrace, fovDeliveryPath string, fovGoodputPath string) {
 	var wg sync.WaitGroup
 
 	startTime := time.Now()
 
 	baseLatency := time.Duration(baseLatencyMs) * time.Millisecond
-	firstTile := 100
-	lastTile := 177
+
+	const (
+		totalTimeSegments = 120
+		firstSegment      = 1
+		lastSegment       = totalTimeSegments
+		firstTile         = 100
+		lastTile          = 177
+	)
 
 	playbackSimulator := NewPlaybackSimulator(
 		segmentDuration,
 		baseLatency,
-		firstTile,
-		lastTile,
+		firstSegment,
+		lastSegment,
 	)
 
 	parallelismSemaphore := NewSemaphore(parallelism)
 
-	log.Printf("Starting test iteration for tiles %d to %d", firstTile, lastTile)
+	log.Printf("Starting test iteration for segments %d to %d (tiles %d to %d)", firstSegment, lastSegment, firstTile, lastTile)
 	fmt.Printf("Test started with parallelism = %d\n", parallelism)
 
 	playbackSimulator.Start()
@@ -306,45 +602,44 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 	var firstRequestOnce sync.Once
 	var firstRequestTime time.Time
 
-	const totalTimeSegments = 120
-
 	collector := netstats.New(totalTimeSegments)
 	currentBitrate := model.HIGH_BITRATE
 	var lastDownloadedSegment atomic.Int32
-	lastDownloadedSegment.Store(int32(firstTile - 1))
+	lastDownloadedSegment.Store(int32(firstSegment - 1))
 
 	agg := newSegmentCompletionAgg()
 	aggFOV := newSegmentCompletionAgg()
 	staleAgg := newStaleBytesAgg()
+	deadlineAgg := newTileDeadlineMissAgg()
+	fovHit := newFovHitAgg()
+	fovGoodput := newFovGoodputAgg(segmentDuration)
 
 	lastFOVSegment := 0
 	if fovTrace != nil {
 		lastFOVSegment = fovTrace.MaxSegment()
-		if lastFOVSegment > totalTimeSegments {
-			lastFOVSegment = totalTimeSegments
+		if lastFOVSegment > lastSegment {
+			lastFOVSegment = lastSegment
 		}
-		if lastFOVSegment < 0 {
+		if lastFOVSegment < firstSegment {
 			lastFOVSegment = 0
 		}
 	}
-	for segIdx := 1; segIdx <= totalTimeSegments; segIdx++ {
-		var tiles []int
-		if fovTrace != nil {
-			tiles = fovTrace.TilesForSegment(segIdx)
-		}
-		aggFOV.SetRequired(segIdx, tiles)
+
+	tileUniverse := make([]int, 0, lastTile-firstTile+1)
+	for tileID := firstTile; tileID <= lastTile; tileID++ {
+		tileUniverse = append(tileUniverse, tileID)
 	}
 
-	for tileID := firstTile; tileID <= lastTile; tileID++ {
-		log.Printf("Processing tile %d", tileID)
+	for segmentID := firstSegment; segmentID <= lastSegment; segmentID++ {
+		log.Printf("Processing segment %d", segmentID)
 
 		avgThroughput := collector.AvgThroughput()
 		bufferLevel := playbackSimulator.GetBufferLevel(int(lastDownloadedSegment.Load()))
 		currentBitrate = adaptBitrateWithBuffer(avgThroughput, bufferLevel)
 		log.Printf("ABR: Average Throughput = %.2f, Buffer Level = %.2f s, Selected Bitrate = %d", avgThroughput, bufferLevel.Seconds(), currentBitrate)
 
-		playbackSimulator.WaitUntilWithinPrefetchWindow(tileID)
-		timeBudget := playbackSimulator.GetTimeToReceive(tileID)
+		playbackSimulator.WaitUntilWithinPrefetchWindow(segmentID)
+		timeBudget := playbackSimulator.GetTimeToReceive(segmentID)
 		if timeBudget <= 0 {
 			timeBudget = segmentDuration
 		}
@@ -353,29 +648,29 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 			timeBudget = maxAhead
 		}
 		timeBudget += segmentDuration
-		tileDeadline := time.Now().Add(timeBudget)
-		segmentBitrate := currentBitrate
+		segmentDeadline := time.Now().Add(timeBudget)
 
-		requiredSegments := make([]int, totalTimeSegments)
-		for k := 1; k <= totalTimeSegments; k++ {
-			requiredSegments[k-1] = k
+		agg.SetRequired(segmentID, tileUniverse)
+		var fovTiles []int
+		if fovTrace != nil {
+			fovTiles = filterTilesInRange(fovTrace.TilesForSegment(segmentID), firstTile, lastTile)
 		}
-		agg.SetRequired(tileID, requiredSegments)
+		aggFOV.SetRequired(segmentID, fovTiles)
 
-		for timeSegment := 1; timeSegment <= totalTimeSegments; timeSegment++ {
-			inFOV := fovTrace != nil && fovTrace.Contains(timeSegment, tileID)
+		for tileID := firstTile; tileID <= lastTile; tileID++ {
+			inFOV := fovTrace != nil && fovTrace.Contains(segmentID, tileID)
 
 			priority := model.LOW_PRIORITY
 			requestBitrate := model.LOW_BITRATE
 			if inFOV {
 				priority = model.HIGH_PRIORITY
-				requestBitrate = segmentBitrate
+				requestBitrate = currentBitrate
 			}
 
 			parallelismSemaphore.Acquire()
 			wg.Add(1)
 
-			go func(tileID, timeSegment int, deadline time.Time, bitrate model.Bitrate, priority model.Priority, inFOV bool) {
+			go func(segmentID, tileID int, deadline time.Time, bitrate model.Bitrate, priority model.Priority, inFOV bool) {
 				defer func() {
 					parallelismSemaphore.Release()
 					wg.Done()
@@ -383,12 +678,16 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 
 				remaining := time.Until(deadline)
 				if remaining <= 0 {
-					ratio, complete := agg.Record(tileID, timeSegment, false)
+					ratio, complete := agg.Record(segmentID, tileID, false)
 					tmrValue := -1.0
 					if complete {
 						tmrValue = ratio
 					}
-					aggFOV.Record(timeSegment, tileID, false)
+					if inFOV {
+						aggFOV.Record(segmentID, tileID, false)
+					}
+					deadlineAgg.Add(inFOV, true)
+					fovHit.Add(segmentID, inFOV, false)
 					if statisticsLogger != nil {
 						bufferSec := playbackSimulator.GetBufferLevel(int(lastDownloadedSegment.Load())).Seconds()
 						statisticsLogger.Log(time.Since(startTime), model.VideoPacketRequest{
@@ -396,9 +695,9 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 							Priority: priority,
 							Bitrate:  bitrate,
 							Segment:  tileID,
-							Tile:     timeSegment,
+							Tile:     segmentID,
 							Timeout:  0,
-						}, 0, true, true, false, 0.0, bufferSec, tmrValue, inFOV)
+						}, 0, true, true, false, 0.0, bufferSec, tmrValue, inFOV, false)
 					}
 					return
 				}
@@ -414,11 +713,11 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 					Priority: priority,
 					Bitrate:  bitrate,
 					Segment:  tileID,
-					Tile:     timeSegment,
+					Tile:     segmentID,
 					Timeout:  timeoutMs,
 				}
 
-				fmt.Printf("Sending request for tile %d, segment %d (priority=%d, FOV=%t)\n", tileID, timeSegment, priority, inFOV)
+				fmt.Printf("Sending request for segment %d, tile %d (priority=%d, FOV=%t)\n", segmentID, tileID, priority, inFOV)
 
 				firstRequestOnce.Do(func() { firstRequestTime = time.Now() })
 
@@ -429,44 +728,49 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 				response := client.Request(request, remaining)
 				responseTime := time.Since(startTime)
 
+				bytesReceived := 0
 				var timedOut bool
-				var late bool
 				if response == nil {
-					fmt.Printf("Timeout: no response for tile %d, segment %d\n", tileID, timeSegment)
+					fmt.Printf("Timeout: no response for segment %d, tile %d\n", segmentID, tileID)
 					timedOut = true
 					instaThroughput = 0.0
 				} else {
 					if len(response.Data) == 0 {
-						log.Panicf("Empty response for (%d, %d)", tileID, timeSegment)
+						log.Panicf("Empty response for (%d, %d)", segmentID, tileID)
 					}
-					bytesReceived := len(response.Data)
+					bytesReceived = len(response.Data)
 					_, instaThroughput = collector.RecordRecv(request.ID, bytesReceived)
 
-					late = time.Now().After(deadline)
+					late := time.Now().After(deadline)
 					staleAgg.Add(bytesReceived, late)
 
 					if late {
-						fmt.Printf("Late response for tile %d, segment %d\n", tileID, timeSegment)
+						fmt.Printf("Late response for segment %d, tile %d\n", segmentID, tileID)
 						timedOut = true
 					} else {
-						fmt.Printf("Received response for tile %d, segment %d\n", tileID, timeSegment)
+						fmt.Printf("Received response for segment %d, tile %d\n", segmentID, tileID)
 						timedOut = false
 					}
 				}
 
 				onTime := (response != nil) && (!timedOut)
-				ratio, complete := agg.Record(tileID, timeSegment, onTime)
+				fovHit.Add(segmentID, inFOV, onTime)
+				fovGoodput.Add(responseTime, bytesReceived, inFOV, onTime)
+				deadlineAgg.Add(inFOV, !onTime)
+				ratio, complete := agg.Record(segmentID, tileID, onTime)
 				tmrValue := -1.0
 				if complete {
 					tmrValue = ratio
 				}
-				aggFOV.Record(timeSegment, tileID, onTime)
+				if inFOV {
+					aggFOV.Record(segmentID, tileID, onTime)
+				}
 
 				if response != nil {
 					for {
 						oldValue := lastDownloadedSegment.Load()
-						if int32(tileID) > oldValue {
-							if lastDownloadedSegment.CompareAndSwap(oldValue, int32(tileID)) {
+						if int32(segmentID) > oldValue {
+							if lastDownloadedSegment.CompareAndSwap(oldValue, int32(segmentID)) {
 								break
 							}
 						} else {
@@ -477,9 +781,9 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 
 				if statisticsLogger != nil {
 					statisticsLogger.Log(requestTime, request,
-						responseTime-requestTime, timedOut, false, !timedOut, instaThroughput, sendBufferSec, tmrValue, inFOV)
+						responseTime-requestTime, timedOut, false, !timedOut, instaThroughput, sendBufferSec, tmrValue, inFOV, onTime)
 				}
-			}(tileID, timeSegment, tileDeadline, requestBitrate, priority, inFOV)
+			}(segmentID, tileID, segmentDeadline, requestBitrate, priority, inFOV)
 		}
 	}
 
@@ -487,6 +791,8 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 	wg.Wait()
 	log.Println("All goroutines completed.")
 	fmt.Println("Test iteration complete.")
+
+	elapsed := time.Since(startTime)
 
 	var joinLatency time.Duration
 	if !firstRequestTime.IsZero() {
@@ -500,12 +806,12 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 		log.Println("Join latency: first request timestamp not captured")
 	}
 
-	completionRate := agg.Rate(firstTile, lastTile)
+	completionRate := agg.Rate(firstSegment, lastSegment)
 	log.Printf("Segment completion rate (ALL tiles): %.2f%%", completionRate)
 
 	fovCompletionRate := -1.0
 	if lastFOVSegment > 0 {
-		fovCompletionRate = aggFOV.Rate(1, lastFOVSegment)
+		fovCompletionRate = aggFOV.Rate(firstSegment, lastFOVSegment)
 		log.Printf("Segment completion rate (FOV tiles): %.2f%%", fovCompletionRate)
 	} else {
 		log.Println("Segment completion rate (FOV tiles): N/A (no FOV trace)")
@@ -514,8 +820,28 @@ func runTestIteration(client *Client, parallelism int, baseLatencyMs int,
 	staleRatio := staleAgg.RatioPercent()
 	log.Printf("Stale bytes ratio: %.2f%%", staleRatio)
 
+	fovMissRate, nonFOVMissRate := deadlineAgg.Rates()
+	log.Printf("Deadline miss rate (FOV tiles): %.2f%%", fovMissRate)
+	log.Printf("Deadline miss rate (non-FOV tiles): %.2f%%", nonFOVMissRate)
+
+	fovHitRate := fovHit.RateOverall()
+	log.Printf("FoV hit rate (delivery): %.2f%%", fovHitRate)
+
+	fovGoodputRate := fovGoodput.OverallKbps(elapsed)
+	log.Printf("Useful goodput (FoV): %.2f kbps", fovGoodputRate)
+
 	if summaryLogger != nil {
-		summaryLogger.LogSession(joinLatency, completionRate, fovCompletionRate, staleRatio)
+		summaryLogger.LogSession(joinLatency, completionRate, fovCompletionRate, staleRatio, fovMissRate, nonFOVMissRate, fovHitRate, fovGoodputRate)
+	}
+
+	if fovDeliveryPath != "" {
+		samples := fovHit.Series(firstSegment, lastSegment)
+		writeFOVDeliverySeries(fovDeliveryPath, samples)
+	}
+
+	if fovGoodputPath != "" {
+		goodputSamples := fovGoodput.Series()
+		writeFOVGoodputSeries(fovGoodputPath, goodputSamples)
 	}
 }
 
