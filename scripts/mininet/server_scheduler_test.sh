@@ -15,14 +15,14 @@ showUsage() {
     echo "-o DIR                  Select output directory"
 }
 
-SERVER_MODE="sp"
-SERVER_BW="4"
+SERVER_MODE="fifo"
+SERVER_BW="100"
 CLIENT_BW="100"
-LOSS="1.0"
-PARALELLISM="48"
-DELAY="30"
-LOAD="60"
-BASE_LATENCY="0"
+LOSS="2"
+PARALELLISM="128"
+DELAY="0"
+LOAD="0"
+BASE_LATENCY="250"
 IP=
 LOG_DIR=
 

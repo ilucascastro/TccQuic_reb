@@ -2,240 +2,289 @@ package stream_handler
 
 import (
 	"log"
-	"main/src/model"
-	"main/src/server/datastructures"
-	"main/src/server/stream_handler/scheduler"
 	"sync"
+	"time"
+
+	"main/src/model"
+	"main/src/server/metrics"
 )
 
-const maxTasksPerPriorityLevel int = 1000
+// ----------------------------- Tipos públicos -----------------------------
 
 type QueuePolicy string
 
 const (
-	FifoQueue           QueuePolicy = "fifo"
-	StrictPriorityQueue QueuePolicy = "sp"
-	WeightedFairQueue   QueuePolicy = "wfq"
+	PolicyFIFO QueuePolicy = "fifo"
+	PolicySP   QueuePolicy = "sp"  // strict priority (não-preemptivo)
+	PolicyWFQ  QueuePolicy = "wfq" // weighted fair queuing simples
 )
 
+// TaskScheduler é a interface usada pelo stream_handler.go
 type TaskScheduler interface {
-	Stop()
-	Enqueue(priority model.Priority, task func()) bool
+	Enqueue(p model.Priority, fn func()) bool
 	Run()
+	Stop()
 }
 
+// ----------------------------- Implementação -----------------------------
+
+type task struct {
+	prio     model.Priority
+	fn       func()
+	enqueued time.Time
+}
+
+type Scheduler struct {
+	policy QueuePolicy
+
+	// filas por prioridade (low=0, med=1, high=2)
+	queues [int(model.PRIORITY_LEVEL_COUNT)][]task
+
+	// controle de execução
+	mu      sync.Mutex
+	cond    *sync.Cond
+	stopped bool
+	running bool
+
+	// WFQ: pesos e estado do RR
+	wfqWeights [int(model.PRIORITY_LEVEL_COUNT)]int // default: low=1, med=2, high=3
+	wfqCursor  int
+	wfqBudget  [int(model.PRIORITY_LEVEL_COUNT)]int
+}
+
+// NewTaskScheduler cria um escalonador com a política desejada
 func NewTaskScheduler(policy QueuePolicy) TaskScheduler {
-	if policy == FifoQueue {
-		return newFifoTaskScheduler()
-	} else {
-		return newPriorityTaskScheduler(policy)
+	s := &Scheduler{
+		policy: policy,
 	}
-}
+	// pesos WFQ default (ajuste se quiser)
+	s.wfqWeights[model.LOW_PRIORITY] = 1
+	s.wfqWeights[model.MEDIUM_PRIORITY] = 2
+	s.wfqWeights[model.HIGH_PRIORITY] = 3
 
-// FIFO Task Scheduler
+	s.cond = sync.NewCond(&s.mu)
 
-type fifoTaskScheduler struct {
-	scheduler scheduler.Scheduler[func()]
-
-	mutex     *sync.Mutex
-	cond      *sync.Cond
-	isStopped bool
-}
-
-func newFifoTaskScheduler() *fifoTaskScheduler {
-	sc := scheduler.NewFIFO[func()](maxTasksPerPriorityLevel * model.PRIORITY_LEVEL_COUNT)
-
-	mutex := &sync.Mutex{}
-	cond := sync.NewCond(mutex)
-
-	return &fifoTaskScheduler{
-		scheduler: sc,
-
-		mutex:     mutex,
-		cond:      cond,
-		isStopped: false,
-	}
-}
-
-func (fs *fifoTaskScheduler) Stop() {
-	fs.mutex.Lock()
-
-	fs.isStopped = true
-
-	fs.mutex.Unlock()
-	fs.cond.Broadcast()
-
-}
-
-func (fs *fifoTaskScheduler) Enqueue(priority model.Priority, task func()) bool {
-	fs.mutex.Lock()
-
-	entry := fs.scheduler.CreateEntry(task)
-	ok := entry != nil
-	if ok {
-		ok = entry.Enqueue()
+	// Expor pesos ao módulo de WFQ utilization (se for WFQ)
+	if policy == PolicyWFQ {
+		metrics.SetWFQWeights(map[int]float64{
+			int(model.LOW_PRIORITY):    float64(s.wfqWeights[model.LOW_PRIORITY]),
+			int(model.MEDIUM_PRIORITY): float64(s.wfqWeights[model.MEDIUM_PRIORITY]),
+			int(model.HIGH_PRIORITY):   float64(s.wfqWeights[model.HIGH_PRIORITY]),
+		})
 	}
 
-	fs.mutex.Unlock()
-	fs.cond.Broadcast()
-
-	return ok
+	return s
 }
 
-func (fs *fifoTaskScheduler) Run() {
-	fs.mutex.Lock()
+// ----------------------------- API pública -------------------------------
 
-	for !fs.isStopped {
-		entry := fs.scheduler.Dequeue()
-		if entry == nil {
-			fs.cond.Wait()
-			continue
-		}
-
-		task := entry.UserData()
-
-		// Execute task outside mutex
-		fs.mutex.Unlock()
-		task()
-		fs.mutex.Lock()
-	}
-
-	fs.mutex.Unlock()
-}
-
-// Priority Task Scheduler
-
-type priorityTaskScheduler struct {
-	groups    []*priorityGroup
-	scheduler scheduler.Scheduler[int]
-
-	mutex     *sync.Mutex
-	cond      *sync.Cond
-	isStopped bool
-}
-
-type priorityGroup struct {
-	// nil if the priority has no tasks scheduled.
-	entry    scheduler.SchedulerEntry[int]
-	tasks    datastructures.CircularQueue[func()]
-	priority float32
-}
-
-func getPriority(policy QueuePolicy, priorityGroup model.Priority) float32 {
-	switch priorityGroup {
-	case model.HIGH_PRIORITY:
-		if policy == WeightedFairQueue {
-			return 49.0
-		} else {
-			return 120.0
-		}
-	case model.MEDIUM_PRIORITY:
-		return 110.0
-	case model.LOW_PRIORITY:
-		return 100.0
-	default:
-		panic("invalid priority group")
-	}
-}
-
-func newPriorityTaskScheduler(policy QueuePolicy) *priorityTaskScheduler {
-	var sc scheduler.Scheduler[int]
-	switch policy {
-	case StrictPriorityQueue:
-		sc = scheduler.NewSP[int](model.PRIORITY_LEVEL_COUNT)
-	case WeightedFairQueue:
-		sc = scheduler.NewWFQ[int](model.PRIORITY_LEVEL_COUNT)
-	default:
-		panic("invalid queue policy")
-	}
-
-	groups := make([]*priorityGroup, model.PRIORITY_LEVEL_COUNT)
-	for i := 0; i < model.PRIORITY_LEVEL_COUNT; i++ {
-		groups[i] = &priorityGroup{
-			entry:    nil,
-			tasks:    datastructures.NewCircularQueue[func()](maxTasksPerPriorityLevel),
-			priority: getPriority(policy, model.Priority(i)),
-		}
-	}
-
-	mutex := &sync.Mutex{}
-	cond := sync.NewCond(mutex)
-
-	return &priorityTaskScheduler{
-		groups:    groups,
-		scheduler: sc,
-
-		mutex:     mutex,
-		cond:      cond,
-		isStopped: false,
-	}
-}
-
-func (ps *priorityTaskScheduler) Stop() {
-	ps.mutex.Lock()
-
-	ps.isStopped = true
-
-	ps.mutex.Unlock()
-	ps.cond.Broadcast()
-
-}
-
-func (ps *priorityTaskScheduler) Enqueue(priority model.Priority, task func()) bool {
-	priorityGroupId := int(priority)
-
-	ps.mutex.Lock()
-
-	if priorityGroupId < 0 || priorityGroupId > model.PRIORITY_LEVEL_COUNT-1 {
-		log.Printf("Invalid priority group %d. Must be between 0 and %d.\n",
-			priorityGroupId, model.PRIORITY_LEVEL_COUNT-1)
+func (s *Scheduler) Enqueue(p model.Priority, fn func()) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
 		return false
 	}
+	// enfileira
+	s.queues[int(p)] = append(s.queues[int(p)], task{
+		prio:     p,
+		fn:       fn,
+		enqueued: time.Now(),
+	})
 
-	group := ps.groups[priorityGroupId]
+	// backlog mudou (soma de todas as filas)
+	metrics.UpdateBacklog(s.totalQueuedLocked())
 
-	wasEmpty := group.tasks.IsEmpty()
-	ok := group.tasks.Enqueue(task)
-	if ok && wasEmpty {
-		if group.entry == nil {
-			group.entry = ps.scheduler.CreateEntry(priorityGroupId)
-		}
-		group.entry.SetPriority(group.priority)
-		ok = group.entry.Enqueue()
-	}
-
-	ps.mutex.Unlock()
-	ps.cond.Broadcast()
-
-	return ok
+	// acorda a goroutine do Run
+	s.cond.Signal()
+	return true
 }
 
-func (ps *priorityTaskScheduler) Run() {
-	ps.mutex.Lock()
+func (s *Scheduler) Run() {
+	s.mu.Lock()
+	if s.running {
+		s.mu.Unlock()
+		return
+	}
+	s.running = true
+	s.mu.Unlock()
 
-	for !ps.isStopped {
-		entry := ps.scheduler.Dequeue()
-		if entry == nil {
-			ps.cond.Wait()
-			continue
+	log.Printf("[SCHED] running with policy=%s", s.policy)
+
+    for {
+        // escolhe próxima tarefa (bloqueando se necessário)
+        t, ok := s.nextTaskBlocking()
+        if !ok {
+            // parado
+            break
+        }
+
+        // executa fora do lock com proteção contra panics
+        func() {
+            defer func() {
+                if r := recover(); r != nil {
+                    log.Printf("[SCHED] task panic recovered: %v", r)
+                }
+            }()
+            if t.fn == nil {
+                // tarefa inválida; apenas ignore
+                log.Printf("[SCHED] warning: picked task with nil fn")
+                return
+            }
+            t.fn()
+        }()
+    }
+    log.Printf("[SCHED] stopped")
+}
+
+func (s *Scheduler) Stop() {
+	s.mu.Lock()
+	s.stopped = true
+	s.mu.Unlock()
+	s.cond.Broadcast()
+}
+
+// ----------------------- QueueLenProvider (opcional) ----------------------
+
+// QueueLenPerClass expõe comprimentos das filas por classe (para sampling)
+func (s *Scheduler) QueueLenPerClass() map[model.Priority]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m := make(map[model.Priority]int, int(model.PRIORITY_LEVEL_COUNT))
+	for i := 0; i < int(model.PRIORITY_LEVEL_COUNT); i++ {
+		m[model.Priority(i)] = len(s.queues[i])
+	}
+	return m
+}
+
+// ----------------------------- Seleção ------------------------------------
+
+func (s *Scheduler) nextTaskBlocking() (task, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for {
+		if s.stopped {
+			return task{}, false
 		}
 
-		priorityGroupId := entry.UserData()
-		group := ps.groups[priorityGroupId]
-
-		if task, ok := group.tasks.Dequeue(); ok {
-			if !group.tasks.IsEmpty() {
-				entry.Enqueue()
-			} else {
-				group.entry = nil
+		if total := s.totalQueuedLocked(); total > 0 {
+			var t task
+			switch s.policy {
+			case PolicyFIFO:
+				t = s.pickFIFO()
+			case PolicySP:
+				t = s.pickSP()
+			case PolicyWFQ:
+				t = s.pickWFQ()
+			default:
+				t = s.pickFIFO()
 			}
 
-			// Execute task outside mutex
-			ps.mutex.Unlock()
-			task()
-			ps.mutex.Lock()
+			// após remover a task das filas, o backlog mudou
+			metrics.UpdateBacklog(s.totalQueuedLocked())
+			// vamos começar a processar => estado busy
+			metrics.UpdateServiceState(true)
+
+			return t, true
+		}
+
+		// filas vazias → servidor idle (antes de bloquear)
+		metrics.UpdateServiceState(false)
+
+		s.cond.Wait()
+	}
+}
+
+// total de itens enfileirados (com lock)
+func (s *Scheduler) totalQueuedLocked() int {
+	n := 0
+	for i := 0; i < int(model.PRIORITY_LEVEL_COUNT); i++ {
+		n += len(s.queues[i])
+	}
+	return n
+}
+
+// ----------------------------- Políticas ----------------------------------
+
+// FIFO global: pega o mais antigo entre todas as filas.
+func (s *Scheduler) pickFIFO() task {
+	// encontra o task com menor enqueued
+	found := false
+	var bestIdx int
+	var bestQ int
+	var bestEnq time.Time
+
+	for q := 0; q < int(model.PRIORITY_LEVEL_COUNT); q++ {
+		if len(s.queues[q]) == 0 {
+			continue
+		}
+		t := s.queues[q][0]
+		if !found || t.enqueued.Before(bestEnq) {
+			found = true
+			bestEnq = t.enqueued
+			bestIdx = 0
+			bestQ = q
+		}
+	}
+	t := s.queues[bestQ][bestIdx]
+	// remove da fila
+	s.queues[bestQ] = s.queues[bestQ][1:]
+	return t
+}
+
+// SP (strict priority, não-preemptivo): sempre escolhe a maior prioridade disponível.
+func (s *Scheduler) pickSP() task {
+	// high → medium → low
+    for q := int(model.HIGH_PRIORITY); q <= int(model.LOW_PRIORITY); q++ {
+		if len(s.queues[q]) > 0 {
+			t := s.queues[q][0]
+			s.queues[q] = s.queues[q][1:]
+			// (se implementar preempção real no futuro, chame metrics.M().OnPreempt)
+			return t
+		}
+	}
+	// não deveria chegar aqui (já verificamos total > 0)
+	return task{}
+}
+
+// WFQ simples por fatia de tarefas (peso = nº de tarefas por rodada)
+func (s *Scheduler) pickWFQ() task {
+	nClasses := int(model.PRIORITY_LEVEL_COUNT)
+	// garante orçamento inicial
+	for i := 0; i < nClasses; i++ {
+		if s.wfqBudget[i] <= 0 {
+			s.wfqBudget[i] = s.wfqWeights[i]
 		}
 	}
 
-	ps.mutex.Unlock()
+	checked := 0
+	for checked < nClasses {
+		q := s.wfqCursor % nClasses
+
+		if len(s.queues[q]) > 0 && s.wfqBudget[q] > 0 {
+			// serve dessa fila e consome orçamento
+			t := s.queues[q][0]
+			s.queues[q] = s.queues[q][1:]
+			s.wfqBudget[q]--
+			// fica no mesmo cursor para tentar servir +1 da mesma fila se ainda há orçamento
+			return t
+		}
+
+		// avança cursor e, se orçamento esgotado, recarrega
+		if s.wfqBudget[q] <= 0 {
+			s.wfqBudget[q] = s.wfqWeights[q]
+		}
+		s.wfqCursor = (s.wfqCursor + 1) % nClasses
+		checked++
+	}
+
+	// fallback: se nada foi escolhido (todas filas vazias no giro), devolve FIFO
+	return s.pickFIFO()
+}
+
+// ----------------------------- Utilidades ---------------------------------
+
+// (Opcional) Se em algum momento você adicionar preempção real ao SP, chame isto:
+func (s *Scheduler) notifyPreemption(preempted, preemptor model.Priority) {
+	metrics.M().OnPreempt(preempted, preemptor)
 }
