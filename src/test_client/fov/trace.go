@@ -1,4 +1,4 @@
-package test_client
+package fov
 
 import (
 	"bufio"
@@ -154,4 +154,3 @@ func (t *FOVTrace) MaxSegment() int {
 	}
 	return t.maxSegment
 }
-

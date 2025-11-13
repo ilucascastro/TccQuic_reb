@@ -1,4 +1,4 @@
-package test_client
+package metrics
 
 import (
 	"bufio"

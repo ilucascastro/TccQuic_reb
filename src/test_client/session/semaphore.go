@@ -1,4 +1,4 @@
-package test_client
+package session
 
 type Semaphore struct {
 	channel chan struct{}
