@@ -30,11 +30,12 @@ type TileScheduler struct {
 	lastDownloadedSegment *atomic.Int32
 	sem                   Semaphore
 	wg                    sync.WaitGroup
+	abr                   ABRController
 }
 
 func NewTileScheduler(client RequestSender, playback *PlaybackSimulator, collector *netstats.StatsCollector,
 	metrics *metrics.Session, statsLogger *metrics.StatisticsLogger, sem Semaphore, startTime time.Time,
-	lastDownloadedSegment *atomic.Int32) *TileScheduler {
+	lastDownloadedSegment *atomic.Int32, abr ABRController) *TileScheduler {
 	return &TileScheduler{
 		client:                client,
 		playback:              playback,
@@ -44,20 +45,21 @@ func NewTileScheduler(client RequestSender, playback *PlaybackSimulator, collect
 		startTime:             startTime,
 		lastDownloadedSegment: lastDownloadedSegment,
 		sem:                   sem,
+		abr:                   abr,
 	}
 }
 
-func (s *TileScheduler) ScheduleSegment(segmentID int, deadline time.Time, currentBitrate model.Bitrate,
+func (s *TileScheduler) ScheduleSegment(segmentID int, deadline time.Time, avgThroughput float64, bufferLevel time.Duration,
 	firstTile, lastTile int, fovTrace *fov.FOVTrace) {
 	for tileID := firstTile; tileID <= lastTile; tileID++ {
 		inFOV := fovTrace != nil && fovTrace.Contains(segmentID, tileID)
 
 		priority := model.LOW_PRIORITY
-		requestBitrate := model.LOW_BITRATE
 		if inFOV {
 			priority = model.HIGH_PRIORITY
-			requestBitrate = currentBitrate
 		}
+
+		requestBitrate := s.abr.Select(avgThroughput, bufferLevel, inFOV)
 
 		s.sem.Acquire()
 		s.wg.Add(1)

@@ -7,14 +7,14 @@ import (
 	"main/src/model"
 )
 
-// ABRController encapsulates bitrate selection so the session orchestration
-// only depends on an interface and different strategies can be plugged in.
+// O ABRController encapsula a seleção de bitrate, de modo que a orquestração da sessão
+// depende apenas de uma interface e diferentes estratégias podem ser integradas.
 type ABRController interface {
-	Select(avgThroughput float64, bufferLevel time.Duration) model.Bitrate
+	Select(avgThroughput float64, bufferLevel time.Duration, inFOV bool) model.Bitrate
 }
 
-// BitrateInfo associates a bitrate value with the minimum throughput threshold
-// required to safely request it.
+// BitrateInfo associa um valor de bitrate (taxa de bits) ao threshold (limite mínimo)
+// de throughput (taxa de transferência) necessário para solicitá-lo com segurança.
 type BitrateInfo struct {
 	Bitrate   model.Bitrate
 	Threshold float64
@@ -24,8 +24,13 @@ type bufferAwareABR struct {
 	bitrates []BitrateInfo
 }
 
-// NewDefaultABRController returns the existing heuristic packaged inside the
-// ABRController interface.
+const (
+	minBufferLevel = 2 * time.Second
+	maxBufferLevel = 10 * time.Second
+)
+
+// NewDefaultABRController retorna a heurística existente empacotada dentro da
+// interface ABRController.
 func NewDefaultABRController() ABRController {
 	return &bufferAwareABR{
 		bitrates: []BitrateInfo{
@@ -36,11 +41,10 @@ func NewDefaultABRController() ABRController {
 	}
 }
 
-func (c *bufferAwareABR) Select(avgThroughput float64, bufferLevel time.Duration) model.Bitrate {
-	const (
-		minBufferLevel = 2 * time.Second
-		maxBufferLevel = 10 * time.Second
-	)
+func (c *bufferAwareABR) Select(avgThroughput float64, bufferLevel time.Duration, inFOV bool) model.Bitrate {
+	if !inFOV {
+		return model.LOW_BITRATE
+	}
 
 	if bufferLevel < minBufferLevel {
 		log.Printf("ABR (Buffer): Buffer level (%v) is below minimum (%v). Forcing LOW_BITRATE.", bufferLevel, minBufferLevel)
@@ -48,8 +52,8 @@ func (c *bufferAwareABR) Select(avgThroughput float64, bufferLevel time.Duration
 	}
 
 	if bufferLevel > maxBufferLevel {
-		// Allow aggressive selection when buffer is healthy by checking thresholds
-		// from highest to lowest. No extra logic needed—the ordering handles it.
+		// Permitir seleção agressiva quando o buffer estiver íntegro, verificando os limites
+		// do mais alto para o mais baixo. Nenhuma lógica extra é necessária, a ordenação cuida disso.
 	}
 
 	for _, brInfo := range c.bitrates {
