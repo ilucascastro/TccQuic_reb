@@ -2,6 +2,7 @@ package session
 
 import (
 	"log"
+	"strings"
 	"time"
 
 	"main/src/model"
@@ -10,7 +11,27 @@ import (
 // O ABRController encapsula a seleção de bitrate, de modo que a orquestração da sessão
 // depende apenas de uma interface e diferentes estratégias podem ser integradas.
 type ABRController interface {
-	Select(avgThroughput float64, bufferLevel time.Duration, inFOV bool) model.Bitrate
+	SelectConfig(ctx SegmentContext) SegmentConfig
+}
+
+// SegmentContext aggregates per-segment inputs needed by ABR selection.
+type SegmentContext struct {
+	SegmentID       int
+	FirstSegment    int
+	LastSegment     int
+	SegmentDuration time.Duration
+	TimeBudget      time.Duration
+	AvgThroughput   float64
+	BufferLevel     time.Duration
+	FOVTiles        []int
+	AllTiles        []int
+}
+
+// SegmentConfig describes per-segment bitrate decisions for FOV vs non-FOV tiles.
+type SegmentConfig struct {
+	ID            string
+	FOVBitrate    model.Bitrate
+	NonFOVBitrate model.Bitrate
 }
 
 // BitrateInfo associa um valor de bitrate (taxa de bits) ao threshold (limite mínimo)
@@ -41,7 +62,31 @@ func NewDefaultABRController() ABRController {
 	}
 }
 
-func (c *bufferAwareABR) Select(avgThroughput float64, bufferLevel time.Duration, inFOV bool) model.Bitrate {
+// SelectABRController picks the ABR implementation based on environment config.
+// Default is BOLA for tiled streaming.
+func SelectABRController(env Environment) ABRController {
+	mode := strings.ToLower(strings.TrimSpace(env.ABRMode))
+	switch mode {
+	case "", "bola", "bola_finite", "bolafinite":
+		return NewBOLAFiniteABR()
+	case "default", "legacy", "threshold":
+		return NewDefaultABRController()
+	default:
+		log.Printf("Unknown ABR_MODE=%q, defaulting to BOLA", env.ABRMode)
+		return NewBOLAFiniteABR()
+	}
+}
+
+func (c *bufferAwareABR) SelectConfig(ctx SegmentContext) SegmentConfig {
+	fovBitrate := c.selectBitrate(ctx.AvgThroughput, ctx.BufferLevel, true)
+	return SegmentConfig{
+		ID:            "default",
+		FOVBitrate:    fovBitrate,
+		NonFOVBitrate: model.LOW_BITRATE,
+	}
+}
+
+func (c *bufferAwareABR) selectBitrate(avgThroughput float64, bufferLevel time.Duration, inFOV bool) model.Bitrate {
 	if !inFOV {
 		return model.LOW_BITRATE
 	}

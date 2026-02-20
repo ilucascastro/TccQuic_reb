@@ -37,6 +37,7 @@ type Environment struct {
 	SummaryPath     string
 	FOVDeliveryPath string
 	FOVGoodputPath  string
+	ABRMode         string
 }
 
 type TestSession struct {
@@ -63,6 +64,7 @@ func NewTestSession(client RequestSender, env Environment, opts Options) *TestSe
 	metricSet := metrics.NewSession(opts.SegmentDuration)
 	collector := netstats.New(opts.LastSegment - opts.FirstSegment + 1)
 	semaphore := NewSemaphore(opts.Parallelism)
+	abr := SelectABRController(env)
 
 	session := &TestSession{
 		client:        client,
@@ -73,7 +75,7 @@ func NewTestSession(client RequestSender, env Environment, opts Options) *TestSe
 		playback:      playback,
 		metrics:       metricSet,
 		collector:     collector,
-		abr:           NewDefaultABRController(),
+		abr:           abr,
 		semaphore:     semaphore,
 		tileUniverse:  buildTileUniverse(opts.FirstTile, opts.LastTile),
 	}
@@ -92,7 +94,7 @@ func (s *TestSession) Run() error {
 	}
 
 	startTime := time.Now()
-	scheduler := NewTileScheduler(s.client, s.playback, s.collector, s.metrics, s.statsLogger, s.semaphore, startTime, &s.lastDownloadedSegment, s.abr)
+	scheduler := NewTileScheduler(s.client, s.playback, s.collector, s.metrics, s.statsLogger, s.semaphore, startTime, &s.lastDownloadedSegment)
 
 	log.Printf("Starting test iteration for segments %d to %d (tiles %d to %d)", s.opts.FirstSegment, s.opts.LastSegment, s.opts.FirstTile, s.opts.LastTile)
 	fmt.Printf("Test started with parallelism = %d\n", s.opts.Parallelism)
@@ -114,8 +116,6 @@ func (s *TestSession) processSegment(segmentID int, scheduler *TileScheduler) {
 	log.Printf("Processing segment %d", segmentID)
 	avgThroughput := s.collector.AvgThroughput()
 	bufferLevel := s.playback.GetBufferLevel(int(s.lastDownloadedSegment.Load()))
-	fovBitrate := s.abr.Select(avgThroughput, bufferLevel, true)
-	log.Printf("ABR: Average Throughput = %.2f, Buffer Level = %.2f s, Selected Bitrate (FOV tiles) = %d", avgThroughput, bufferLevel.Seconds(), fovBitrate)
 
 	s.playback.WaitUntilWithinPrefetchWindow(segmentID)
 	timeBudget := s.playback.GetTimeToReceive(segmentID)
@@ -136,7 +136,21 @@ func (s *TestSession) processSegment(segmentID int, scheduler *TileScheduler) {
 	}
 	s.metrics.FOVTiles.SetRequired(segmentID, fovTiles)
 
-	scheduler.ScheduleSegment(segmentID, segmentDeadline, avgThroughput, bufferLevel, s.opts.FirstTile, s.opts.LastTile, s.fovTrace)
+	ctx := SegmentContext{
+		SegmentID:       segmentID,
+		FirstSegment:    s.opts.FirstSegment,
+		LastSegment:     s.opts.LastSegment,
+		SegmentDuration: s.opts.SegmentDuration,
+		TimeBudget:      timeBudget,
+		AvgThroughput:   avgThroughput,
+		BufferLevel:     bufferLevel,
+		FOVTiles:        fovTiles,
+		AllTiles:        s.tileUniverse,
+	}
+	cfg := s.abr.SelectConfig(ctx)
+	log.Printf("ABR: cfg=%s fov_bitrate=%d nonfov_bitrate=%d avg_tp=%.2f buffer=%.2f s", cfg.ID, cfg.FOVBitrate, cfg.NonFOVBitrate, avgThroughput, bufferLevel.Seconds())
+
+	scheduler.ScheduleSegment(segmentID, segmentDeadline, cfg, s.opts.FirstTile, s.opts.LastTile, s.fovTrace)
 }
 
 func (s *TestSession) finalize(startTime time.Time, firstRequestTime time.Time) {

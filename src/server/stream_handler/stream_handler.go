@@ -380,8 +380,9 @@ func readFile(req *model.VideoPacketRequest) []byte {
 	if err != nil {
 		log.Printf("[FS] getwd err: %v", err)
 	}
+	// dataset naming is track{tile}_{segment}, so tile first, segment second
 	filePath := fmt.Sprintf("/data/segments/video_tiled_10_dash_track%d_%d.m4s",
-		req.Segment, req.Tile)
+		req.Tile, req.Segment)
 	full := basePath + filePath
 	data, err := os.ReadFile(full)
 	if err != nil {
@@ -395,7 +396,7 @@ func readFile(req *model.VideoPacketRequest) []byte {
 func estimateTileSize(req *model.VideoPacketRequest) int64 {
 	basePath, _ := os.Getwd()
 	full := fmt.Sprintf("%s/data/segments/video_tiled_10_dash_track%d_%d.m4s",
-		basePath, req.Segment, req.Tile)
+		basePath, req.Tile, req.Segment)
 	st, err := os.Stat(full)
 	if err != nil {
 		return 0

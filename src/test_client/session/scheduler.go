@@ -30,12 +30,11 @@ type TileScheduler struct {
 	lastDownloadedSegment *atomic.Int32
 	sem                   Semaphore
 	wg                    sync.WaitGroup
-	abr                   ABRController
 }
 
 func NewTileScheduler(client RequestSender, playback *PlaybackSimulator, collector *netstats.StatsCollector,
 	metrics *metrics.Session, statsLogger *metrics.StatisticsLogger, sem Semaphore, startTime time.Time,
-	lastDownloadedSegment *atomic.Int32, abr ABRController) *TileScheduler {
+	lastDownloadedSegment *atomic.Int32) *TileScheduler {
 	return &TileScheduler{
 		client:                client,
 		playback:              playback,
@@ -45,11 +44,10 @@ func NewTileScheduler(client RequestSender, playback *PlaybackSimulator, collect
 		startTime:             startTime,
 		lastDownloadedSegment: lastDownloadedSegment,
 		sem:                   sem,
-		abr:                   abr,
 	}
 }
 
-func (s *TileScheduler) ScheduleSegment(segmentID int, deadline time.Time, avgThroughput float64, bufferLevel time.Duration,
+func (s *TileScheduler) ScheduleSegment(segmentID int, deadline time.Time, cfg SegmentConfig,
 	firstTile, lastTile int, fovTrace *fov.FOVTrace) {
 	for tileID := firstTile; tileID <= lastTile; tileID++ {
 		inFOV := fovTrace != nil && fovTrace.Contains(segmentID, tileID)
@@ -59,7 +57,10 @@ func (s *TileScheduler) ScheduleSegment(segmentID int, deadline time.Time, avgTh
 			priority = model.HIGH_PRIORITY
 		}
 
-		requestBitrate := s.abr.Select(avgThroughput, bufferLevel, inFOV)
+		requestBitrate := cfg.NonFOVBitrate
+		if inFOV {
+			requestBitrate = cfg.FOVBitrate
+		}
 
 		s.sem.Acquire()
 		s.wg.Add(1)
@@ -90,8 +91,8 @@ func (s *TileScheduler) handleTile(segmentID, tileID int, deadline time.Time, bi
 		ID:       uuid.Must(uuid.New(), nil),
 		Priority: priority,
 		Bitrate:  bitrate,
-		Segment:  tileID,
-		Tile:     segmentID,
+		Segment:  segmentID,
+		Tile:     tileID,
 		Timeout:  timeoutMs,
 	}
 
@@ -180,8 +181,8 @@ func (s *TileScheduler) registerTimeout(segmentID, tileID int, priority model.Pr
 			ID:       uuid.Nil,
 			Priority: priority,
 			Bitrate:  bitrate,
-			Segment:  tileID,
-			Tile:     segmentID,
+			Segment:  segmentID,
+			Tile:     tileID,
 			Timeout:  0,
 		}, 0, true, true, false, 0.0, bufferSec, tmrValue, inFOV, false)
 	}

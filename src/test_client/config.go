@@ -11,6 +11,7 @@ const (
 	defaultFOVTracePath  = "data/user_fov.csv"
 	defaultFOVTraceFPS   = 30
 	defaultSegmentDurationSeconds = 1
+	defaultABRMode       = "bola" //or default
 )
 
 // EnvironmentConfig centralizes values that previously lived as scattered
@@ -24,6 +25,7 @@ type EnvironmentConfig struct {
 	SummaryPath    string
 	FOVDeliveryPath string
 	FOVGoodputPath  string
+	ABRMode         string
 }
 
 func ResolveEnvironmentConfig() EnvironmentConfig {
@@ -31,6 +33,7 @@ func ResolveEnvironmentConfig() EnvironmentConfig {
 		Pipeline:       defaultPipeline,
 		FOVTracePath:   getEnvOrDefault("FOV_TRACE_PATH", defaultFOVTracePath),
 		FOVTraceFPS:    getEnvInt("FOV_TRACE_FPS", defaultFOVTraceFPS),
+		ABRMode:        getEnvOrDefault("ABR_MODE", defaultABRMode),
 	}
 
 	pid := os.Getpid()
