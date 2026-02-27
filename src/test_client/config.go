@@ -25,6 +25,7 @@ type EnvironmentConfig struct {
 	SummaryPath    string
 	FOVDeliveryPath string
 	FOVGoodputPath  string
+	DeadlineLatenessPath string
 	ABRMode         string
 }
 
@@ -41,6 +42,7 @@ func ResolveEnvironmentConfig() EnvironmentConfig {
 	cfg.SummaryPath = fmt.Sprintf("statistics-summary-%d.csv", pid)
 	cfg.FOVDeliveryPath = fmt.Sprintf("fov-delivery-%d.csv", pid)
 	cfg.FOVGoodputPath = fmt.Sprintf("fov-goodput-%d.csv", pid)
+	cfg.DeadlineLatenessPath = fmt.Sprintf("deadline-lateness-%d.csv", pid)
 
 	return cfg
 }

@@ -37,6 +37,7 @@ type Environment struct {
 	SummaryPath     string
 	FOVDeliveryPath string
 	FOVGoodputPath  string
+	DeadlineLatenessPath string
 	ABRMode         string
 }
 
@@ -130,6 +131,7 @@ func (s *TestSession) processSegment(segmentID int, scheduler *TileScheduler) {
 	segmentDeadline := time.Now().Add(timeBudget)
 
 	s.metrics.AllTiles.SetRequired(segmentID, s.tileUniverse)
+	s.metrics.DeadlineLateness.SetRequired(segmentID, s.tileUniverse)
 	var fovTiles []int
 	if s.fovTrace != nil {
 		fovTiles = filterTilesInRange(s.fovTrace.TilesForSegment(segmentID), s.opts.FirstTile, s.opts.LastTile)
@@ -182,6 +184,8 @@ func (s *TestSession) finalize(startTime time.Time, firstRequestTime time.Time) 
 
 	staleRatio := s.metrics.Stale.RatioPercent()
 	log.Printf("Stale bytes ratio: %.2f%%", staleRatio)
+	timelyRatio := s.metrics.Stale.TimelyPercent()
+	log.Printf("Timely bytes ratio: %.2f%%", timelyRatio)
 
 	fovMissRate, nonFOVMissRate := s.metrics.Deadlines.Rates()
 	log.Printf("Deadline miss rate (FOV tiles): %.2f%%", fovMissRate)
@@ -194,7 +198,7 @@ func (s *TestSession) finalize(startTime time.Time, firstRequestTime time.Time) 
 	log.Printf("Useful goodput (FoV): %.2f kbps", fovGoodputRate)
 
 	if s.summaryLogger != nil {
-		s.summaryLogger.LogSession(joinLatency, completionRate, fovCompletionRate, staleRatio, fovMissRate, nonFOVMissRate, fovHitRate, fovGoodputRate)
+		s.summaryLogger.LogSession(joinLatency, completionRate, fovCompletionRate, staleRatio, fovMissRate, nonFOVMissRate, fovHitRate, fovGoodputRate, timelyRatio)
 	}
 
 	if s.env.FOVDeliveryPath != "" {
@@ -205,6 +209,11 @@ func (s *TestSession) finalize(startTime time.Time, firstRequestTime time.Time) 
 	if s.env.FOVGoodputPath != "" {
 		goodputSamples := s.metrics.FOVGoodput.Series()
 		metrics.WriteFOVGoodputSeries(s.env.FOVGoodputPath, goodputSamples)
+	}
+
+	if s.env.DeadlineLatenessPath != "" {
+		latenessSamples := s.metrics.DeadlineLateness.Series(s.opts.FirstSegment, s.opts.LastSegment)
+		metrics.WriteDeadlineLatenessSeries(s.env.DeadlineLatenessPath, latenessSamples)
 	}
 }
 

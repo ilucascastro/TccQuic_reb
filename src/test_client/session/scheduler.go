@@ -15,6 +15,8 @@ import (
 	"main/src/test_client/netstats"
 )
 
+const staleMeasurementGrace = 200 * time.Millisecond
+
 // TileScheduler owns the goroutine fan-out per segment. The session prepares
 // per-segment context (deadline, ABR decisions, required tiles) and invokes
 // ScheduleSegment, while the scheduler handles request/response bookkeeping.
@@ -77,7 +79,7 @@ func (s *TileScheduler) handleTile(segmentID, tileID int, deadline time.Time, bi
 
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
-		s.registerTimeout(segmentID, tileID, priority, bitrate, inFOV)
+		s.registerTimeout(segmentID, tileID, priority, bitrate, inFOV, deadline)
 		return
 	}
 
@@ -104,8 +106,17 @@ func (s *TileScheduler) handleTile(segmentID, tileID int, deadline time.Time, bi
 	s.collector.RecordSend(request.ID)
 
 	requestTime := time.Since(s.startTime)
-	response := s.client.Request(request, remaining)
+	requestTimeout := remaining + staleMeasurementGrace
+	if requestTimeout <= 0 {
+		requestTimeout = time.Millisecond
+	}
+	response := s.client.Request(request, requestTimeout)
+	arrivalAt := time.Now()
 	responseTime := time.Since(s.startTime)
+	lateness := arrivalAt.Sub(deadline)
+	if lateness < 0 {
+		lateness = 0
+	}
 
 	bytesReceived := 0
 	var timedOut bool
@@ -131,6 +142,8 @@ func (s *TileScheduler) handleTile(segmentID, tileID int, deadline time.Time, bi
 			timedOut = false
 		}
 	}
+
+	s.metrics.DeadlineLateness.Record(segmentID, tileID, lateness)
 
 	onTime := (response != nil) && (!timedOut)
 	s.metrics.FOVHit.Add(segmentID, inFOV, onTime)
@@ -164,7 +177,13 @@ func (s *TileScheduler) handleTile(segmentID, tileID int, deadline time.Time, bi
 	}
 }
 
-func (s *TileScheduler) registerTimeout(segmentID, tileID int, priority model.Priority, bitrate model.Bitrate, inFOV bool) {
+func (s *TileScheduler) registerTimeout(segmentID, tileID int, priority model.Priority, bitrate model.Bitrate, inFOV bool, deadline time.Time) {
+	lateness := time.Since(deadline)
+	if lateness < 0 {
+		lateness = 0
+	}
+	s.metrics.DeadlineLateness.Record(segmentID, tileID, lateness)
+
 	ratio, complete := s.metrics.AllTiles.Record(segmentID, tileID, false)
 	tmrValue := -1.0
 	if complete {

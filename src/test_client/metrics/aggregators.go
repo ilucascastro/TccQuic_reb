@@ -18,6 +18,7 @@ type Session struct {
 	Deadlines  *TileDeadlineMissAgg
 	FOVHit     *FovHitAgg
 	FOVGoodput *FovGoodputAgg
+	DeadlineLateness *DeadlineLatenessAgg
 }
 
 func NewSession(segmentDuration time.Duration) *Session {
@@ -28,6 +29,7 @@ func NewSession(segmentDuration time.Duration) *Session {
 		Deadlines:  NewTileDeadlineMissAgg(),
 		FOVHit:     NewFovHitAgg(),
 		FOVGoodput: NewFovGoodputAgg(segmentDuration),
+		DeadlineLateness: NewDeadlineLatenessAgg(),
 	}
 }
 
@@ -85,6 +87,17 @@ func (a *StaleBytesAgg) RatioPercent() float64 {
 		return 0.0
 	}
 	return 100.0 * float64(a.lateBytes) / float64(a.totalBytes)
+}
+
+// TimelyPercent returns the percentage of bytes that arrived on time.
+func (a *StaleBytesAgg) TimelyPercent() float64 {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	if a.totalBytes == 0 {
+		return 0.0
+	}
+	onTimeBytes := a.totalBytes - a.lateBytes
+	return 100.0 * float64(onTimeBytes) / float64(a.totalBytes)
 }
 
 // Aggregator for deadline misses per tile class (FOV vs non-FOV).
@@ -254,6 +267,128 @@ type FovGoodputSample struct {
 	WindowEnd   time.Duration
 	Bytes       uint64
 	Kbps        float64
+}
+
+// Aggregator for segment-level "Age/Lateness at deadline":
+// per tile lateness = max(0, arrival - deadline), and per segment we keep
+// the max lateness among required tiles.
+type DeadlineLatenessAgg struct {
+	mutex       sync.Mutex
+	required    map[int]map[int]struct{}
+	processed   map[int]map[int]struct{}
+	maxLateness map[int]time.Duration
+	maxTile     map[int]int
+	final       map[int]DeadlineLatenessSample
+}
+
+type DeadlineLatenessSample struct {
+	Segment    int
+	LastTile   int
+	LatenessMs float64
+	Required   int
+	Processed  int
+}
+
+func NewDeadlineLatenessAgg() *DeadlineLatenessAgg {
+	return &DeadlineLatenessAgg{
+		required:    make(map[int]map[int]struct{}),
+		processed:   make(map[int]map[int]struct{}),
+		maxLateness: make(map[int]time.Duration),
+		maxTile:     make(map[int]int),
+		final:       make(map[int]DeadlineLatenessSample),
+	}
+}
+
+func (a *DeadlineLatenessAgg) SetRequired(segment int, tiles []int) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	set := make(map[int]struct{}, len(tiles))
+	for _, tile := range tiles {
+		set[tile] = struct{}{}
+	}
+
+	a.required[segment] = set
+	a.processed[segment] = make(map[int]struct{})
+	delete(a.maxLateness, segment)
+	delete(a.maxTile, segment)
+	delete(a.final, segment)
+}
+
+func (a *DeadlineLatenessAgg) Record(segment int, tile int, lateness time.Duration) (time.Duration, bool) {
+	if lateness < 0 {
+		lateness = 0
+	}
+
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	req, ok := a.required[segment]
+	if !ok || len(req) == 0 {
+		return 0, false
+	}
+	if _, required := req[tile]; !required {
+		if sample, done := a.final[segment]; done {
+			return time.Duration(sample.LatenessMs * float64(time.Millisecond)), true
+		}
+		return a.maxLateness[segment], false
+	}
+
+	proc := a.processed[segment]
+	if proc == nil {
+		proc = make(map[int]struct{})
+		a.processed[segment] = proc
+	}
+	if _, duplicate := proc[tile]; duplicate {
+		if sample, done := a.final[segment]; done {
+			return time.Duration(sample.LatenessMs * float64(time.Millisecond)), true
+		}
+		return a.maxLateness[segment], false
+	}
+	proc[tile] = struct{}{}
+
+	currentMax, hasMax := a.maxLateness[segment]
+	if !hasMax || lateness >= currentMax {
+		a.maxLateness[segment] = lateness
+		a.maxTile[segment] = tile
+	}
+
+	if len(proc) == len(req) {
+		sample := DeadlineLatenessSample{
+			Segment:    segment,
+			LastTile:   a.maxTile[segment],
+			LatenessMs: float64(a.maxLateness[segment]) / float64(time.Millisecond),
+			Required:   len(req),
+			Processed:  len(proc),
+		}
+		a.final[segment] = sample
+		return a.maxLateness[segment], true
+	}
+
+	return a.maxLateness[segment], false
+}
+
+func (a *DeadlineLatenessAgg) Series(firstSegment, lastSegment int) []DeadlineLatenessSample {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	if lastSegment < firstSegment {
+		return nil
+	}
+
+	series := make([]DeadlineLatenessSample, 0, lastSegment-firstSegment+1)
+	for seg := firstSegment; seg <= lastSegment; seg++ {
+		req := a.required[seg]
+		if len(req) == 0 {
+			continue
+		}
+		sample, ok := a.final[seg]
+		if !ok {
+			continue
+		}
+		series = append(series, sample)
+	}
+	return series
 }
 
 func (a *FovGoodputAgg) Series() []FovGoodputSample {
@@ -495,6 +630,34 @@ func WriteFOVGoodputSeries(path string, samples []FovGoodputSample) {
 		startSec := sample.WindowStart.Seconds()
 		endSec := sample.WindowEnd.Seconds()
 		if _, err := fmt.Fprintf(writer, "%.3f,%.3f,%d,%.2f\n", startSec, endSec, sample.Bytes, sample.Kbps); err != nil {
+			log.Printf("Failed to write sample to %s: %v", path, err)
+			return
+		}
+	}
+}
+
+func WriteDeadlineLatenessSeries(path string, samples []DeadlineLatenessSample) {
+	if path == "" {
+		return
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		log.Printf("Failed to create %s: %v", path, err)
+		return
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+	defer writer.Flush()
+
+	if _, err := writer.WriteString("segment,last_tile,lateness_ms,required_tiles,processed_tiles\n"); err != nil {
+		log.Printf("Failed to write header to %s: %v", path, err)
+		return
+	}
+
+	for _, sample := range samples {
+		if _, err := fmt.Fprintf(writer, "%d,%d,%.3f,%d,%d\n",
+			sample.Segment, sample.LastTile, sample.LatenessMs, sample.Required, sample.Processed); err != nil {
 			log.Printf("Failed to write sample to %s: %v", path, err)
 			return
 		}

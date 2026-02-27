@@ -77,6 +77,11 @@ def render_client_plot(input_files, output_dir):
                     metrics['stale_bytes_ratio_percent'] = float(row['stale_bytes_ratio_percent'])
                 except Exception:
                     pass
+            if 'timely_bytes_ratio_percent' in row:
+                try:
+                    metrics['timely_bytes_ratio_percent'] = float(row['timely_bytes_ratio_percent'])
+                except Exception:
+                    pass
     else:
         # Fallback: compute completion rates from statistics-*.csv
         stats_files = [p for p in input_files if os.path.basename(p).startswith('statistics-') and 'summary' not in os.path.basename(p)]
@@ -111,6 +116,7 @@ def render_client_plot(input_files, output_dir):
         'segment_completion_rate_percent',
         'segment_completion_rate_fov_percent',
         'stale_bytes_ratio_percent',
+        'timely_bytes_ratio_percent',
     ):
         if key in metrics:
             labels.append(key.replace('_', '\n'))
