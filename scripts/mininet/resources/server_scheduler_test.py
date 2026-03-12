@@ -14,6 +14,7 @@ print("[INFO] Running processes on server and client...")
 
 
 SERVER_MODE = os.environ['SERVER_MODE']
+ABR_MODE = os.environ.get('ABR_MODE', 'bola')
 SERVER_BW = float(os.environ['SERVER_BW'])
 CLIENT_BW = float(os.environ['CLIENT_BW'])
 LOSS = float(os.environ['LOSS'])
@@ -23,6 +24,7 @@ LOAD = float(os.environ['LOAD'])
 BASE_LATENCY = int(os.environ['BASE_LATENCY'])
 
 print('SERVER_MODE=', SERVER_MODE)
+print('ABR_MODE=', ABR_MODE)
 print('SERVER_BW=', SERVER_BW)
 print('CLIENT_BW=', CLIENT_BW)
 print('LOSS=', LOSS)
@@ -81,7 +83,7 @@ class Test():
             stdout=subprocess.PIPE)
         # Start client
         self.processes[self.client] = self.client.popen(
-            [dir + '/main', 'test-client', self.server.IP(), str(PARALELLISM),
+            ['env', f'ABR_MODE={ABR_MODE}', dir + '/main', 'test-client', self.server.IP(), str(PARALELLISM),
              str(BASE_LATENCY)],
             cwd=dir,
             stderr=subprocess.STDOUT,

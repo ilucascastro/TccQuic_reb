@@ -5,6 +5,7 @@ showUsage() {
     echo "Usage: $PROGRAM_NAME [OPTIONS] <IP>"
     echo "OPTIONS:"
     echo "--fifo, --sp, --wfq     Select server mode (default: fifo)"
+    echo "--abr MODE              Select client ABR mode (bola|legacy)"
     echo "--sbw N                 Select server bandwidth in Mbps"
     echo "--cbw N                 Select client bandwidth in Mbps"
     echo "--baselatency N         Select client base latency"
@@ -16,6 +17,7 @@ showUsage() {
 }
 
 SERVER_MODE="sp"
+ABR_MODE="bola"
 SERVER_BW="4"
 CLIENT_BW="100"
 LOSS="3"
@@ -31,6 +33,7 @@ while [[ "$#" > 0 ]]; do
     --fifo) SERVER_MODE="fifo"              ; shift   ;;
     --sp)   SERVER_MODE="sp"                ; shift   ;;
     --wfq)  SERVER_MODE="wfq"               ; shift   ;;
+    --abr)  ABR_MODE="$2"                   ; shift 2 ;;
     --sbw)  SERVER_BW="$2"                  ; shift 2 ;;
     --cbw)  CLIENT_BW="$2"                  ; shift 2 ;;
     --baselatency)  BASE_LATENCY="$2"       ; shift 2 ;;
@@ -59,8 +62,8 @@ NC='\033[0m'
 if [[ -z "$LOG_DIR" ]]; then
     LOG_NUMBER=1
     while true; do
-        LOG_DIR=$(printf "../../logs/%s/%s-sbw%s-cbw%s-%03d/" \
-            $(basename "${PROGRAM_NAME%.*}") $SERVER_MODE $SERVER_BW \
+        LOG_DIR=$(printf "../../logs/%s/%s-%s-sbw%s-cbw%s-%03d/" \
+            $(basename "${PROGRAM_NAME%.*}") $SERVER_MODE $ABR_MODE $SERVER_BW \
             $CLIENT_BW $LOG_NUMBER)
         if [[ ! -e "$LOG_DIR" ]]; then
             break
@@ -142,9 +145,23 @@ withSSH "dos2unix $REMOTE_DIR/utils.py"
 echo -e "${PURPLE}Executing...${NC}"
 
 mkdir -p "$LOG_DIR"
+if [[ ! -f "$LOG_DIR/experiment.env" ]]; then
+    : > "$LOG_DIR/experiment.env"
+fi
+cat >> "$LOG_DIR/experiment.env" <<EOF
+server_mode=$SERVER_MODE
+abr_mode=$ABR_MODE
+server_bw_mbps=$SERVER_BW
+client_bw_mbps=$CLIENT_BW
+loss_pct=$LOSS
+parallelism=$PARALELLISM
+delay_ms=$DELAY
+background_load_pct=$LOAD
+base_latency_ms=$BASE_LATENCY
+EOF
 
 withSSH "cd $REMOTE_DIR && \
-        sudo env SERVER_MODE='$SERVER_MODE' SERVER_BW='$SERVER_BW' \
+        sudo env SERVER_MODE='$SERVER_MODE' ABR_MODE='$ABR_MODE' SERVER_BW='$SERVER_BW' \
             CLIENT_BW='$CLIENT_BW' LOSS='$LOSS' PARALELLISM='$PARALELLISM' \
             DELAY='$DELAY' LOAD='$LOAD' BASE_LATENCY='$BASE_LATENCY' \
             ./server_scheduler_test.py" 2>&1 | tee "$LOG_DIR/stdout"
