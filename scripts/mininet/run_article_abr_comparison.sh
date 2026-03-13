@@ -4,16 +4,18 @@ set -euo pipefail
 
 PROGRAM_NAME=$0
 showUsage() {
-    echo "Usage: $PROGRAM_NAME [--pilot] <IP>"
+    echo "Usage: $PROGRAM_NAME [--pilot|--reduced|--full] <IP>"
 }
 
-PILOT=0
+PROFILE="reduced"
 IP=
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
-    --pilot) PILOT=1 ; shift ;;
-    -*)      showUsage ; exit 1 ;;
-    *)       IP="$1" ; shift ;;
+    --pilot)   PROFILE="pilot" ; shift ;;
+    --reduced) PROFILE="reduced" ; shift ;;
+    --full)    PROFILE="full" ; shift ;;
+    -*)        showUsage ; exit 1 ;;
+    *)         IP="$1" ; shift ;;
     esac
 done
 
@@ -35,10 +37,34 @@ while true; do
 done
 mkdir -p "$SUPER_LOG_DIR"
 
-BASE_LATENCIES=(10 50 100 200 300 400 500 1000)
-if [[ "$PILOT" == "1" ]]; then
+BASE_LATENCIES=(500)
+SCHEDULERS=(fifo sp wfq)
+ABRS=(bola legacy)
+SCENARIOS=(
+    "1 10 24"
+    "3 10 16"
+    "6 30 10"
+)
+
+case "$PROFILE" in
+pilot)
     BASE_LATENCIES=(10)
-fi
+    SCHEDULERS=(wfq)
+    ABRS=(bola legacy)
+    SCENARIOS=("1 10 24")
+    ;;
+reduced)
+    # The paper indicates initial playback delay can be fixed arbitrarily for long sessions.
+    BASE_LATENCIES=(500)
+    ;;
+full)
+    BASE_LATENCIES=(10 50 100 200 300 400 500 1000)
+    ;;
+*)
+    echo "Unknown profile: $PROFILE"
+    exit 1
+    ;;
+esac
 
 launchScenario() {
     local scenario="$1"
@@ -48,16 +74,9 @@ launchScenario() {
     local loss=2
     local bw=100
 
-    local schedulers=(fifo sp wfq)
-    local abrs=(bola legacy)
-    if [[ "$PILOT" == "1" ]]; then
-        schedulers=(wfq)
-        abrs=(bola legacy)
-    fi
-
     for base_latency in "${BASE_LATENCIES[@]}"; do
-        for scheduler in "${schedulers[@]}"; do
-            for abr in "${abrs[@]}"; do
+        for scheduler in "${SCHEDULERS[@]}"; do
+            for abr in "${ABRS[@]}"; do
                 LOG_DIR=$(printf "%s/scenario%s-baselatency%s/%s/%s/" \
                     "$SUPER_LOG_DIR" "$scenario" "$base_latency" "$scheduler" "$abr")
                 mkdir -p "$LOG_DIR"
@@ -85,13 +104,16 @@ EOF
     done
 }
 
-launchScenario 1 10 24
-if [[ "$PILOT" != "1" ]]; then
-    launchScenario 3 10 16
-    launchScenario 6 30 10
-fi
+echo "[INFO] profile=$PROFILE scenarios=${#SCENARIOS[@]} schedulers=${#SCHEDULERS[@]} abrs=${#ABRS[@]} base_latencies=${#BASE_LATENCIES[@]}"
+for scenario_def in "${SCENARIOS[@]}"; do
+    # shellcheck disable=SC2086
+    launchScenario $scenario_def
+done
 
 python3 resources/collect_abr_comparison_results.py \
     "$SUPER_LOG_DIR" "$SUPER_LOG_DIR/abr-comparison-summary.csv"
+python3 resources/plot_abr_comparison_summary.py \
+    "$SUPER_LOG_DIR/abr-comparison-summary.csv" \
+    "$SUPER_LOG_DIR/abr-comparison-summary.png"
 
 echo "[INFO] Logs: $(cd "$SUPER_LOG_DIR" && pwd)"
